@@ -338,6 +338,32 @@ describe("generateWranglerConfig", () => {
     expect(parsed.images).toBeDefined();
     expect(parsed.images.binding).toBe("IMAGES");
   });
+
+  it("adds directory to assets and omits main/images for static export", () => {
+    mkdir(tmpDir, "app");
+    const info = detectProject(tmpDir);
+    info.output = "export";
+    const config = generateWranglerConfig(info);
+    const parsed = JSON.parse(config);
+
+    expect(parsed.assets.directory).toBe("export");
+    expect(parsed.assets.binding).toBeUndefined();
+    expect(parsed.main).toBeUndefined();
+    expect(parsed.images).toBeUndefined();
+  });
+
+  it("does not add directory to assets for non-export output", () => {
+    mkdir(tmpDir, "app");
+    const info = detectProject(tmpDir);
+    info.output = "";
+    const config = generateWranglerConfig(info);
+    const parsed = JSON.parse(config);
+
+    expect(parsed.assets.directory).toBeUndefined();
+    expect(parsed.assets.binding).toBe("ASSETS");
+    expect(parsed.main).toBe("./worker/index.ts");
+    expect(parsed.images).toBeDefined();
+  });
 });
 
 // ─── Worker Entry Generation ─────────────────────────────────────────────────
@@ -852,6 +878,17 @@ describe("getFilesToGenerate", () => {
     expect(workerFile).toBeDefined();
     expect(workerFile!.content).toContain("vinext/server/app-router-entry");
     expect(workerFile!.content).not.toContain("virtual:vinext-server-entry");
+  });
+
+  it("skips worker/index.ts for static export", () => {
+    mkdir(tmpDir, "app");
+    const info = detectProject(tmpDir);
+    info.output = "export";
+    const files = getFilesToGenerate(info);
+
+    const descriptions = files.map((f) => f.description);
+    expect(descriptions).not.toContain("worker/index.ts");
+    expect(descriptions).toContain("wrangler.jsonc");
   });
 
   it("generates Pages Router worker entry for Pages Router project", () => {

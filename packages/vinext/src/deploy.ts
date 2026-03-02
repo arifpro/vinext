@@ -29,6 +29,7 @@ import {
 import { getReactUpgradeDeps } from "./init.js";
 import { runTPR } from "./cloudflare/tpr.js";
 import { loadDotenv } from "./config/dotenv.js";
+import { loadNextConfig } from "./config/next-config.js";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -110,6 +111,8 @@ interface ProjectInfo {
   hasCodeHike: boolean;
   /** Native Node modules that need stubbing for Workers */
   nativeModulesToStub: string[];
+  /** Build output mode: 'export' for static export, 'standalone' for single server */
+  output: "" | "export" | "standalone";
 }
 
 // ─── Detection ───────────────────────────────────────────────────────────────
@@ -215,7 +218,23 @@ export function detectProject(root: string): ProjectInfo {
     hasMDX,
     hasCodeHike,
     nativeModulesToStub,
+    output: "",
   };
+}
+
+/**
+ * Read the `output` field from next.config without resolving async
+ * redirects/rewrites/headers (which resolveNextConfig does unnecessarily).
+ */
+async function getOutputMode(root: string): Promise<"" | "export" | "standalone"> {
+  try {
+    const config = await loadNextConfig(root);
+    const output = config?.output ?? "";
+    if (output === "export" || output === "standalone") return output;
+    return "";
+  } catch {
+    return "";
+  }
 }
 
 function detectISR(root: string, isAppRouter: boolean): boolean {
@@ -331,6 +350,12 @@ function detectNativeModules(root: string): string[] {
   }
 }
 
+/**
+ * Directory name for static export output. Used by both `generateWranglerConfig`
+ * (assets.directory) and the static export build step so they stay in sync.
+ */
+const STATIC_EXPORT_DIR = "export";
+
 // ─── Project Preparation (pre-build transforms) ─────────────────────────────
 //
 // These are delegated to shared utilities in ./utils/project.ts so they can
@@ -347,25 +372,32 @@ export const renameCJSConfigs = _renameCJSConfigs;
 /** Generate wrangler.jsonc content */
 export function generateWranglerConfig(info: ProjectInfo): string {
   const today = new Date().toISOString().split("T")[0];
+  const isStaticExport = info.output === "export";
 
   const config: Record<string, unknown> = {
     $schema: "node_modules/wrangler/config-schema.json",
     name: info.projectName,
     compatibility_date: today,
     compatibility_flags: ["nodejs_compat"],
-    main: "./worker/index.ts",
+    // Static exports are pure asset deployments — no Worker script needed.
+    ...(isStaticExport ? {} : { main: "./worker/index.ts" }),
     assets: {
       not_found_handling: "none",
+      // For static export, wrangler serves files directly from the build output directory.
+      ...(isStaticExport && { directory: STATIC_EXPORT_DIR }),
       // Expose static assets to the Worker via env.ASSETS so the image
       // optimization handler can fetch source images programmatically.
-      binding: "ASSETS",
+      ...(!isStaticExport && { binding: "ASSETS" }),
     },
     // Cloudflare Images binding for next/image optimization.
     // Enables resize, format negotiation (AVIF/WebP), and quality transforms
     // at the edge. No user setup needed — wrangler creates the binding automatically.
-    images: {
-      binding: "IMAGES",
-    },
+    // Skip for static export since images are pre-optimized at build time.
+    ...(!isStaticExport && {
+      images: {
+        binding: "IMAGES",
+      },
+    }),
   };
 
   if (info.hasISR) {
@@ -958,7 +990,8 @@ export function getFilesToGenerate(info: ProjectInfo): GeneratedFile[] {
     });
   }
 
-  if (!info.hasWorkerEntry) {
+  // Static exports are pure asset deployments — no Worker script needed.
+  if (!info.hasWorkerEntry && info.output !== "export") {
     const workerContent = info.isAppRouter
       ? generateAppRouterWorkerEntry()
       : generatePagesRouterWorkerEntry();
@@ -1079,6 +1112,11 @@ export async function deploy(options: DeployOptions): Promise<void> {
 
   // Step 1: Detect project structure
   const info = detectProject(root);
+
+  // Detect output mode from next.config (async — reads config file).
+  // Must run before any code that reads info.output (e.g. getFilesToGenerate,
+  // generateWranglerConfig). detectProject is sync so this is set separately.
+  info.output = await getOutputMode(root);
 
   if (!info.isAppRouter && !info.isPagesRouter) {
     console.error("  Error: No app/ or pages/ directory found.");
