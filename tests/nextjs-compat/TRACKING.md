@@ -1228,3 +1228,70 @@ The 12 remaining tests in `route-sorting.test.ts` cover unique functionality: dy
 | `tests/script.test.ts` | 9 | Script strategy SSR (beforeInteractive vs others) |
 | `tests/form.test.ts` | 6 | Form SSR, string/function actions, useActionState |
 
+---
+
+## Phase 6: Systematic Audit (Issue #204)
+
+**Source**: https://github.com/cloudflare/vinext/issues/204
+
+This phase addresses the systematic audit of Next.js test directories to find gaps in vinext's
+test coverage. The methodology differs from previous phases: instead of starting with "what features
+do we have?", we start with "what does Next.js test, and do we match?"
+
+### Background
+
+PR #203 fixed a critical security gap where middleware/proxy files with invalid exports
+(e.g., misspelled function names, wrong exports) were silently skipped, letting requests through
+unprotected. This was caught because:
+1. Next.js has a test in `test/e2e/app-dir/proxy-missing-export/`
+2. The test verifies that Next.js throws `ProxyMissingExportError` for invalid exports
+3. vinext was silently failing open instead of throwing
+
+The root cause was that TRACKING.md was built feature-first, missing edge cases that don't map
+neatly to "features."
+
+### Methodology
+
+1. **Directory walk**: Go through every test directory in Next.js repo's test suite
+2. **Relevance check**: Skip build-only, Turbopack-specific, Vercel-deploy-specific tests
+3. **Coverage check**: Compare with existing vinext tests
+4. **Action**: Port test or document why N/A
+
+### Priority
+
+1. Error handling and validation tests (like proxy-missing-export)
+2. Edge cases for already-implemented features
+3. New feature areas
+
+### Audit Progress
+
+#### Priority 1: Error Handling & Validation
+
+| Next.js Test Dir | What it Tests | vinext Coverage | Status |
+|------------------|---------------|-----------------|--------|
+| `test/e2e/app-dir/proxy-missing-export/` | Missing middleware/proxy exports throw error | Covered by PR #203 | ✅ Done |
+| `test/e2e/app-dir/app-middleware-proxy/` | Middleware/proxy functionality | Covered | ✅ Done |
+| `test/development/app-dir/server-navigation-error/` | Server nav error handling | Covered by error-boundary tests | ✅ Done |
+| `test/e2e/app-dir/missing-suspense-with-csr-bailout/` | Suspense boundary errors | Covered by streaming tests | ✅ Done |
+
+#### Priority 2: Edge Cases (In Progress)
+
+| Next.js Test Dir | What it Tests | vinext Coverage | Status |
+|------------------|---------------|-----------------|--------|
+| `test/e2e/app-dir/actions/app-action.test.ts` | Server action edge cases | Covered | ✅ Done |
+| `test/e2e/app-dir/dynamic-io/` | Dynamic IO edge cases | Partial | 🔶 Investigating |
+| `test/e2e/app-dir/app-static/` | Static generation edge cases | N/A (build-only) | ⏭️ Skip |
+
+### Findings
+
+1. **Middleware/proxy export validation**: Fixed by PR #203 - now throws on invalid exports
+2. **Route handler validation**: Currently returns 405 for no valid handler - acceptable UX
+3. **Error boundary coverage**: Comprehensive coverage in Phase 3 and P5-8
+
+### Next Steps
+
+Continue auditing Next.js test directories, focusing on:
+- `test/e2e/app-dir/` (365+ directories)
+- `test/e2e/` top-level (middleware, pages router, config)
+- `test/unit/` (pure function tests)
+
