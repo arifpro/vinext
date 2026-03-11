@@ -19,7 +19,7 @@ import path from "node:path";
 import { createRequire } from "node:module";
 import { execFileSync, type ExecSyncOptions } from "node:child_process";
 import { parseArgs as nodeParseArgs } from "node:util";
-import { createBuilder, build } from "vite";
+import { createBuilder, build, createServer } from "vite";
 import {
   ensureESModule as _ensureESModule,
   renameCJSConfigs as _renameCJSConfigs,
@@ -154,7 +154,12 @@ export function formatMissingCloudflarePluginError(options: {
   );
 }
 
-export function detectProject(root: string): ProjectInfo {
+export function detectProject(
+  root: string,
+  /** Pre-loaded output mode. Pass the result of `getOutputMode()` here so the
+   * returned `ProjectInfo` is complete and callers don't need to patch it. */
+  output: "" | "export" | "standalone" = "",
+): ProjectInfo {
   const hasApp =
     fs.existsSync(path.join(root, "app")) || fs.existsSync(path.join(root, "src", "app"));
   const hasPages =
@@ -250,7 +255,7 @@ export function detectProject(root: string): ProjectInfo {
     hasMDX,
     hasCodeHike,
     nativeModulesToStub,
-    output: "",
+    output,
   };
 }
 
@@ -424,7 +429,9 @@ export function generateWranglerConfig(info: ProjectInfo): string {
     // Static exports are pure asset deployments — no Worker script needed.
     ...(isStaticExport ? {} : { main: "./worker/index.ts" }),
     assets: {
-      not_found_handling: "none",
+      // For static export SPAs, use "404-page" so the CDN serves the custom
+      // 404.html generated at build time rather than a blank 404 response.
+      not_found_handling: isStaticExport ? "404-page" : "none",
       // For static export, wrangler serves files directly from the build output directory.
       ...(isStaticExport && { directory: STATIC_EXPORT_DIR }),
       // Expose static assets to the Worker via env.ASSETS so the image
@@ -993,6 +1000,16 @@ export function getMissingDeps(
 ): MissingDep[] {
   const missing: MissingDep[] = [];
 
+  // Static exports are pure asset deploys — the only tool needed is wrangler.
+  // @cloudflare/vite-plugin, @vitejs/plugin-rsc, and react-server-dom-webpack
+  // are Worker-build dependencies that are irrelevant for static export.
+  if (info.output === "export") {
+    if (!info.hasWrangler) {
+      missing.push({ name: "wrangler", version: "latest" });
+    }
+    return missing;
+  }
+
   if (!info.hasCloudflarePlugin) {
     missing.push({ name: "@cloudflare/vite-plugin", version: "latest" });
   }
@@ -1095,7 +1112,7 @@ export function getFilesToGenerate(info: ProjectInfo): GeneratedFile[] {
     });
   }
 
-  if (!info.hasViteConfig) {
+  if (!info.hasViteConfig && info.output !== "export") {
     const viteContent = info.isAppRouter
       ? generateAppRouterViteConfig(info)
       : generatePagesRouterViteConfig(info);
@@ -1124,19 +1141,90 @@ function writeGeneratedFiles(files: GeneratedFile[]): void {
 
 export async function runBuild(info: ProjectInfo): Promise<void> {
   // Static export (`output: 'export'`) produces a directory of pre-rendered
-  // HTML + static assets — there is no Worker script to build. The static files
-  // must already exist in `STATIC_EXPORT_DIR` (produced by `next build` or
-  // `vinext build`). Wrangler serves them directly from that directory, so we
-  // skip the Workers build entirely here.
+  // HTML + static assets — there is no Worker script to build. We spin up a
+  // Vite dev server, call the appropriate static export function, then shut
+  // it down. The output lands in `STATIC_EXPORT_DIR` and wrangler deploys it.
   if (info.output === "export") {
-    const exportDir = path.join(info.root, STATIC_EXPORT_DIR);
-    if (!fs.existsSync(exportDir)) {
-      throw new Error(
-        `Static export directory not found: ${exportDir}\n` +
-          `Run \`next build\` (or \`vinext build\`) first to generate the static files.`,
-      );
+    console.log("\n  Building static export...\n");
+
+    const vinextPlugin = (await import("./index.js")).default;
+    const { resolveNextConfig } = await import("./config/next-config.js");
+
+    const server = await createServer({
+      root: info.root,
+      configFile: false,
+      plugins: [vinextPlugin({ appDir: info.root })],
+      optimizeDeps: { holdUntilCrawlEnd: true },
+      server: { port: 0, cors: false },
+      logLevel: "silent",
+    });
+    await server.listen();
+
+    try {
+      const addr = server.httpServer?.address();
+      const port = typeof addr === "object" && addr ? addr.port : 0;
+      const baseUrl = `http://localhost:${port}`;
+      const outDir = path.join(info.root, STATIC_EXPORT_DIR);
+      const config = await resolveNextConfig({ output: "export", root: info.root });
+
+      if (info.isAppRouter) {
+        const { appRouter } = await import("./routing/app-router.js");
+        const { staticExportApp } = await import("./build/static-export.js");
+
+        const appDir = fs.existsSync(path.join(info.root, "app"))
+          ? path.join(info.root, "app")
+          : path.join(info.root, "src", "app");
+
+        const routes = await appRouter(appDir);
+        const result = await staticExportApp({ baseUrl, routes, appDir, server, outDir, config });
+
+        for (const warning of result.warnings) {
+          console.warn(`  Warning: ${warning}`);
+        }
+        for (const error of result.errors) {
+          console.error(`  Error [${error.route}]: ${error.error}`);
+        }
+        console.log(
+          `\n  Static export complete: ${result.pageCount} pages → ${STATIC_EXPORT_DIR}/\n`,
+        );
+      } else {
+        const { pagesRouter } = await import("./routing/pages-router.js");
+        const { staticExportPages } = await import("./build/static-export.js");
+
+        const pagesDir = fs.existsSync(path.join(info.root, "pages"))
+          ? path.join(info.root, "pages")
+          : path.join(info.root, "src", "pages");
+
+        const allRoutes = await pagesRouter(pagesDir);
+        const pageRoutes = allRoutes.filter(
+          (r: { filePath: string }) => !r.filePath.includes("/api/"),
+        );
+        const apiRoutes = allRoutes.filter((r: { filePath: string }) =>
+          r.filePath.includes("/api/"),
+        );
+
+        const result = await staticExportPages({
+          server,
+          routes: pageRoutes,
+          apiRoutes,
+          pagesDir,
+          outDir,
+          config,
+        });
+
+        for (const warning of result.warnings) {
+          console.warn(`  Warning: ${warning}`);
+        }
+        for (const error of result.errors) {
+          console.error(`  Error [${error.route}]: ${error.error}`);
+        }
+        console.log(
+          `\n  Static export complete: ${result.pageCount} pages → ${STATIC_EXPORT_DIR}/\n`,
+        );
+      }
+    } finally {
+      await server.close();
     }
-    console.log(`\n  Static export: using pre-built files in ${STATIC_EXPORT_DIR}/\n`);
     return;
   }
 
@@ -1223,13 +1311,13 @@ export async function deploy(options: DeployOptions): Promise<void> {
 
   console.log("\n  vinext deploy\n");
 
-  // Step 1: Detect project structure
-  const info = detectProject(root);
+  // Step 1: Detect output mode from next.config (async — reads config file).
+  // Must run before detectProject so ProjectInfo is fully populated upfront
+  // and no post-construction mutation is needed.
+  const output = await getOutputMode(root);
 
-  // Detect output mode from next.config (async — reads config file).
-  // Must run before any code that reads info.output (e.g. getFilesToGenerate,
-  // generateWranglerConfig). detectProject is sync so this is set separately.
-  info.output = await getOutputMode(root);
+  // Step 2: Detect project structure (output is now baked in)
+  const info = detectProject(root, output);
 
   if (!info.isAppRouter && !info.isPagesRouter) {
     console.error("  Error: No app/ or pages/ directory found.");
@@ -1245,10 +1333,15 @@ export async function deploy(options: DeployOptions): Promise<void> {
   console.log(`  Project: ${info.projectName}`);
   console.log(`  Router:  ${info.isAppRouter ? "App Router" : "Pages Router"}`);
   console.log(`  ISR:     ${info.hasISR ? "detected" : "none"}`);
+  if (info.output === "export") {
+    console.log(`  Output:  static export`);
+  }
 
-  // Step 2: Check and install missing dependencies
-  // For App Router: upgrade React first if needed for react-server-dom-webpack compatibility
-  if (info.isAppRouter) {
+  // Step 3: Check and install missing dependencies
+  // For App Router Worker builds: upgrade React first if needed for
+  // react-server-dom-webpack compatibility. Static exports skip this —
+  // they don't need the Workers build pipeline.
+  if (info.isAppRouter && info.output !== "export") {
     const reactUpgrade = getReactUpgradeDeps(root);
     if (reactUpgrade.length > 0) {
       const installCmd = detectPackageManager(root).replace(/ -D$/, "");
@@ -1269,7 +1362,7 @@ export async function deploy(options: DeployOptions): Promise<void> {
     if (info.isAppRouter) info.hasRscPlugin = true;
   }
 
-  // Step 3: Ensure ESM + rename CJS configs
+  // Step 4: Ensure ESM + rename CJS configs
   if (!info.hasTypeModule) {
     const renamedConfigs = renameCJSConfigs(root);
     for (const [oldName, newName] of renamedConfigs) {
@@ -1281,7 +1374,7 @@ export async function deploy(options: DeployOptions): Promise<void> {
     }
   }
 
-  // Step 4: Generate missing config files
+  // Step 5: Generate missing config files
   const filesToGenerate = getFilesToGenerate(info);
   if (filesToGenerate.length > 0) {
     console.log();
@@ -1291,7 +1384,8 @@ export async function deploy(options: DeployOptions): Promise<void> {
   // Fail if an existing Vite config is missing the Cloudflare plugin.
   // This is the most common cause of "could not resolve virtual:vinext-rsc-entry"
   // errors — `vinext init` generates a minimal local-dev config without it.
-  if (info.hasViteConfig && !viteConfigHasCloudflarePlugin(root)) {
+  // Static exports don't use Vite for the Worker build, so skip this check.
+  if (info.output !== "export" && info.hasViteConfig && !viteConfigHasCloudflarePlugin(root)) {
     throw new Error(formatMissingCloudflarePluginError({ isAppRouter: info.isAppRouter }));
   }
 
@@ -1300,14 +1394,14 @@ export async function deploy(options: DeployOptions): Promise<void> {
     return;
   }
 
-  // Step 5: Build
+  // Step 6: Build
   if (!options.skipBuild) {
     await runBuild(info);
   } else {
     console.log("\n  Skipping build (--skip-build)");
   }
 
-  // Step 6: TPR — pre-render hot pages into KV cache (experimental, opt-in)
+  // Step 7: TPR — pre-render hot pages into KV cache (experimental, opt-in)
   if (options.experimentalTPR) {
     console.log();
     const tprResult = await runTPR({
@@ -1322,7 +1416,7 @@ export async function deploy(options: DeployOptions): Promise<void> {
     }
   }
 
-  // Step 7: Deploy via wrangler
+  // Step 8: Deploy via wrangler
   const url = runWranglerDeploy(root, {
     preview: options.preview ?? false,
     env: options.env,

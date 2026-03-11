@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -289,6 +289,18 @@ describe("detectProject", () => {
     const info = detectProject(tmpDir);
     expect(info.hasISR).toBe(false);
   });
+
+  it("accepts output parameter and bakes it into the returned info", () => {
+    mkdir(tmpDir, "app");
+    const infoDefault = detectProject(tmpDir);
+    expect(infoDefault.output).toBe("");
+
+    const infoExport = detectProject(tmpDir, "export");
+    expect(infoExport.output).toBe("export");
+
+    const infoStandalone = detectProject(tmpDir, "standalone");
+    expect(infoStandalone.output).toBe("standalone");
+  });
 });
 
 // ─── generateWranglerConfig ─────────────────────────────────────────────────
@@ -361,6 +373,7 @@ describe("generateWranglerConfig", () => {
 
     expect(parsed.assets.directory).toBe("export");
     expect(parsed.assets.binding).toBeUndefined();
+    expect(parsed.assets.not_found_handling).toBe("404-page");
     expect(parsed.main).toBeUndefined();
     expect(parsed.images).toBeUndefined();
   });
@@ -830,6 +843,30 @@ describe("getMissingDeps", () => {
     const missing = getMissingDeps(info, allResolvable);
     expect(missing).toHaveLength(0);
   });
+
+  it("only requires wrangler for static export (skips Worker-build deps)", () => {
+    mkdir(tmpDir, "app");
+    const info = detectProject(tmpDir, "export");
+    // Even with all Worker deps absent, only wrangler should be flagged missing.
+    info.hasCloudflarePlugin = false;
+    info.hasWrangler = false;
+    info.hasRscPlugin = false;
+
+    const missing = getMissingDeps(info);
+    expect(missing).toHaveLength(1);
+    expect(missing[0].name).toBe("wrangler");
+  });
+
+  it("returns empty array for static export when wrangler is already installed", () => {
+    mkdir(tmpDir, "app");
+    const info = detectProject(tmpDir, "export");
+    info.hasCloudflarePlugin = false;
+    info.hasWrangler = true;
+    info.hasRscPlugin = false;
+
+    const missing = getMissingDeps(info);
+    expect(missing).toHaveLength(0);
+  });
 });
 
 // ─── isPackageResolvable ─────────────────────────────────────────────────────
@@ -949,6 +986,17 @@ describe("getFilesToGenerate", () => {
     expect(descriptions).toContain("wrangler.jsonc");
   });
 
+  it("skips vite.config.ts for static export", () => {
+    mkdir(tmpDir, "app");
+    const info = detectProject(tmpDir, "export");
+    const files = getFilesToGenerate(info);
+
+    const descriptions = files.map((f) => f.description);
+    expect(descriptions).not.toContain("vite.config.ts");
+    // wrangler.jsonc is still generated for static export
+    expect(descriptions).toContain("wrangler.jsonc");
+  });
+
   it("generates Pages Router worker entry for Pages Router project", () => {
     mkdir(tmpDir, "pages");
     const info = detectProject(tmpDir);
@@ -985,22 +1033,62 @@ describe("getFilesToGenerate", () => {
 // ─── runBuild (static export) ─────────────────────────────────────────────────
 
 describe("runBuild (static export)", () => {
-  it("skips Workers build and resolves when export/ directory exists", async () => {
+  it("calls staticExportApp for App Router and completes without throwing", async () => {
     mkdir(tmpDir, "app");
-    mkdir(tmpDir, "export"); // simulate pre-built static files
-    const info = detectProject(tmpDir);
-    info.output = "export";
+    const info = detectProject(tmpDir, "export");
 
-    // Should resolve without calling createBuilder/build — no Vite in test env
-    await expect(runBuild(info)).resolves.toBeUndefined();
+    // Mock dynamic imports used inside runBuild so the function can complete
+    // without a real Vite project in tmpDir. The top-level `createServer` import
+    // in deploy.ts is already bound, so we can't swap it here — instead we
+    // mock the modules that are `await import()`-ed at runtime.
+    vi.doMock("../packages/vinext/src/index.js", () => ({ default: vi.fn() }));
+    vi.doMock("../packages/vinext/src/config/next-config.js", () => ({
+      resolveNextConfig: vi.fn().mockResolvedValue({}),
+      loadNextConfig: vi.fn().mockResolvedValue({}),
+    }));
+    vi.doMock("../packages/vinext/src/routing/app-router.js", () => ({
+      appRouter: vi.fn().mockResolvedValue([]),
+    }));
+    vi.doMock("../packages/vinext/src/build/static-export.js", () => ({
+      staticExportApp: vi.fn().mockResolvedValue({ pageCount: 0, warnings: [], errors: [] }),
+      staticExportPages: vi.fn().mockResolvedValue({ pageCount: 0, warnings: [], errors: [] }),
+    }));
+
+    try {
+      await expect(runBuild(info)).resolves.toBeUndefined();
+    } finally {
+      vi.doUnmock("../packages/vinext/src/index.js");
+      vi.doUnmock("../packages/vinext/src/config/next-config.js");
+      vi.doUnmock("../packages/vinext/src/routing/app-router.js");
+      vi.doUnmock("../packages/vinext/src/build/static-export.js");
+    }
   });
 
-  it("throws when export/ directory is missing for static export", async () => {
-    mkdir(tmpDir, "app");
-    const info = detectProject(tmpDir);
-    info.output = "export";
+  it("calls staticExportPages for Pages Router and completes without throwing", async () => {
+    mkdir(tmpDir, "pages");
+    const info = detectProject(tmpDir, "export");
 
-    await expect(runBuild(info)).rejects.toThrow(/Static export directory not found/);
+    vi.doMock("../packages/vinext/src/index.js", () => ({ default: vi.fn() }));
+    vi.doMock("../packages/vinext/src/config/next-config.js", () => ({
+      resolveNextConfig: vi.fn().mockResolvedValue({}),
+      loadNextConfig: vi.fn().mockResolvedValue({}),
+    }));
+    vi.doMock("../packages/vinext/src/routing/pages-router.js", () => ({
+      pagesRouter: vi.fn().mockResolvedValue([]),
+    }));
+    vi.doMock("../packages/vinext/src/build/static-export.js", () => ({
+      staticExportApp: vi.fn().mockResolvedValue({ pageCount: 0, warnings: [], errors: [] }),
+      staticExportPages: vi.fn().mockResolvedValue({ pageCount: 0, warnings: [], errors: [] }),
+    }));
+
+    try {
+      await expect(runBuild(info)).resolves.toBeUndefined();
+    } finally {
+      vi.doUnmock("../packages/vinext/src/index.js");
+      vi.doUnmock("../packages/vinext/src/config/next-config.js");
+      vi.doUnmock("../packages/vinext/src/routing/pages-router.js");
+      vi.doUnmock("../packages/vinext/src/build/static-export.js");
+    }
   });
 });
 
