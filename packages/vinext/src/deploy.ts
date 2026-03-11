@@ -425,9 +425,7 @@ export function generateWranglerConfig(info: ProjectInfo): string {
     $schema: "node_modules/wrangler/config-schema.json",
     name: info.projectName,
     compatibility_date: today,
-    // Static exports are pure asset deployments — there is no Worker script,
-    // so nodejs_compat is not needed (and would be misleading).
-    ...(!isStaticExport && { compatibility_flags: ["nodejs_compat"] }),
+    compatibility_flags: ["nodejs_compat"],
     // Static exports are pure asset deployments — no Worker script needed.
     ...(isStaticExport ? {} : { main: "./worker/index.ts" }),
     assets: {
@@ -445,12 +443,9 @@ export function generateWranglerConfig(info: ProjectInfo): string {
     // Cloudflare Images binding for next/image optimization.
     // Enables resize, format negotiation (AVIF/WebP), and quality transforms
     // at the edge. No user setup needed — wrangler creates the binding automatically.
-    // Skip for static export since images are pre-optimized at build time.
-    ...(!isStaticExport && {
-      images: {
-        binding: "IMAGES",
-      },
-    }),
+    images: {
+      binding: "IMAGES",
+    },
   };
 
   if (info.hasISR) {

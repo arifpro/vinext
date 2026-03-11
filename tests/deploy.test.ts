@@ -364,7 +364,7 @@ describe("generateWranglerConfig", () => {
     expect(parsed.images.binding).toBe("IMAGES");
   });
 
-  it("adds directory to assets and omits main/images/compatibility_flags for static export", () => {
+  it("adds directory to assets and omits main for static export", () => {
     mkdir(tmpDir, "app");
     const info = detectProject(tmpDir, "export");
     const config = generateWranglerConfig(info);
@@ -374,9 +374,9 @@ describe("generateWranglerConfig", () => {
     expect(parsed.assets.binding).toBeUndefined();
     expect(parsed.assets.not_found_handling).toBe("single-page-application");
     expect(parsed.main).toBeUndefined();
-    expect(parsed.images).toBeUndefined();
-    // No Worker script means no nodejs_compat needed
-    expect(parsed.compatibility_flags).toBeUndefined();
+    // compatibility_flags and images are kept for forward-compat (harmless for pure asset deploys)
+    expect(parsed.compatibility_flags).toContain("nodejs_compat");
+    expect(parsed.images).toBeDefined();
   });
 
   it("does not add directory to assets for non-export output", () => {
