@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { recordMiddlewareInvocation } from "./instrumentation-state";
 
 /**
  * App Router middleware that uses NextRequest-specific APIs.
@@ -14,6 +15,12 @@ import { NextRequest, NextResponse } from "next/server";
 export function middleware(request: NextRequest) {
   // Test NextRequest.nextUrl - this would fail with TypeError if request is plain Request
   const { pathname } = request.nextUrl;
+
+  // Record this invocation so tests can detect double-execution.
+  // In a hybrid app+pages fixture the Vite connect handler runs middleware
+  // via ssrLoadModule (SSR env) and then the RSC entry runs it again inline
+  // (RSC env). A single request should produce exactly one invocation.
+  recordMiddlewareInvocation(pathname);
 
   // Test NextRequest.cookies - this would fail with TypeError if request is plain Request
   const sessionToken = request.cookies.get("session");
@@ -81,6 +88,19 @@ export function middleware(request: NextRequest) {
     return NextResponse.next({ request: { headers } });
   }
 
+  // Inject mw-pages-fallback-user=1 cookie for mixed app/pages fallback routing.
+  // This ensures the host dev shell can still match a Pages-targeted fallback
+  // rewrite in a mixed project after the middleware header ownership changes.
+  if (pathname === "/mw-gated-fallback-pages" && request.nextUrl.searchParams.has("mw-auth")) {
+    const headers = new Headers(request.headers);
+    const existing = headers.get("cookie") ?? "";
+    headers.set(
+      "cookie",
+      existing ? existing + "; mw-pages-fallback-user=1" : "mw-pages-fallback-user=1",
+    );
+    return NextResponse.next({ request: { headers } });
+  }
+
   // Middleware headers take precedence over next.config.js headers for the same key.
   // Middleware sets e2e-headers=middleware; config sets e2e-headers=next.config.js via /(.*).
   // Ref: opennextjs-cloudflare headers.test.ts — "Middleware headers override next.config.js headers"
@@ -88,6 +108,22 @@ export function middleware(request: NextRequest) {
     const res = NextResponse.next();
     res.headers.set("e2e-headers", "middleware");
     return res;
+  }
+
+  if (pathname === "/header-override-delete") {
+    const headers = new Headers(request.headers);
+    headers.delete("authorization");
+    headers.delete("cookie");
+    headers.set("x-from-middleware", "hello-from-middleware");
+    return NextResponse.next({ request: { headers } });
+  }
+
+  if (pathname === "/pages-header-override-delete") {
+    const headers = new Headers(request.headers);
+    headers.delete("authorization");
+    headers.delete("cookie");
+    headers.set("x-from-middleware", "hello-from-middleware");
+    return NextResponse.next({ request: { headers } });
   }
 
   // Forward search params as a header for RSC testing
@@ -118,8 +154,16 @@ export const config = {
     "/middleware-throw",
     "/search-query",
     "/headers/override-from-middleware",
+    "/header-override-delete",
+    "/pages-header-override-delete",
     "/",
     "/mw-gated-before",
     "/mw-gated-fallback",
+    {
+      source: "/mw-object-gated",
+      has: [{ type: "header", key: "x-mw-allow", value: "1" }],
+      missing: [{ type: "cookie", key: "mw-blocked" }],
+    },
+    "/mw-gated-fallback-pages",
   ],
 };

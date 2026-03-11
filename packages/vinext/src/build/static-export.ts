@@ -18,7 +18,7 @@
  *   - Dynamic routes without generateStaticParams → build error
  */
 import type { ViteDevServer } from "vite";
-import type { Route } from "../routing/pages-router.js";
+import { patternToNextFormat, type Route } from "../routing/pages-router.js";
 import type { AppRoute } from "../routing/app-router.js";
 import type { ResolvedNextConfig } from "../config/next-config.js";
 import { safeJsonStringify } from "../server/html.js";
@@ -74,9 +74,7 @@ export interface StaticExportResult {
  *
  * Creates a directory of static HTML files by rendering each route at build time.
  */
-export async function staticExportPages(
-  options: StaticExportOptions,
-): Promise<StaticExportResult> {
+export async function staticExportPages(options: StaticExportOptions): Promise<StaticExportResult> {
   const { server, routes, apiRoutes, pagesDir, outDir, config } = options;
   const fileMatcher = createValidFileMatcher(config.pageExtensions);
   const result: StaticExportResult = {
@@ -143,8 +141,7 @@ export async function staticExportPages(
         continue;
       }
 
-      const paths: Array<{ params: Record<string, string | string[]> }> =
-        pathsResult?.paths ?? [];
+      const paths: Array<{ params: Record<string, string | string[]> }> = pathsResult?.paths ?? [];
 
       for (const { params } of paths) {
         // Build the URL path from the route pattern and params
@@ -280,7 +277,7 @@ async function renderStaticPage(options: RenderStaticPageOptions): Promise<strin
   // Set SSR context for router shim
   if (typeof routerShim.setSSRContext === "function") {
     routerShim.setSSRContext({
-      pathname: urlPath,
+      pathname: patternToNextFormat(route.pattern),
       query: params,
       asPath: urlPath,
     });
@@ -336,15 +333,14 @@ async function renderStaticPage(options: RenderStaticPageOptions): Promise<strin
 
   // Collect head tags
   const ssrHeadHTML =
-    typeof headShim.getSSRHeadHTML === "function"
-      ? headShim.getSSRHeadHTML()
-      : "";
+    typeof headShim.getSSRHeadHTML === "function" ? headShim.getSSRHeadHTML() : "";
 
   // __NEXT_DATA__ for client hydration
   const nextDataScript = `<script>window.__NEXT_DATA__ = ${safeJsonStringify({
     props: { pageProps },
     page: route.pattern,
     query: params,
+    buildId: _config.buildId,
   })}</script>`;
 
   // Build HTML shell
@@ -400,18 +396,12 @@ interface RenderErrorPageOptions {
   fileMatcher: ValidFileMatcher;
 }
 
-async function renderErrorPage(
-  options: RenderErrorPageOptions,
-): Promise<string | null> {
+async function renderErrorPage(options: RenderErrorPageOptions): Promise<string | null> {
   const { server, pagesDir, statusCode, AppComponent, DocumentComponent, headShim, fileMatcher } =
     options;
 
   const candidates =
-    statusCode === 404
-      ? ["404", "_error"]
-      : statusCode === 500
-        ? ["500", "_error"]
-        : ["_error"];
+    statusCode === 404 ? ["404", "_error"] : statusCode === 500 ? ["500", "_error"] : ["_error"];
 
   for (const candidate of candidates) {
     const candidatePath = path.join(pagesDir, candidate);
@@ -471,10 +461,7 @@ async function renderErrorPage(
  * E.g., "/posts/:id" + { id: "42" } → "/posts/42"
  * E.g., "/docs/:slug+" + { slug: ["a", "b"] } → "/docs/a/b"
  */
-function buildUrlFromParams(
-  pattern: string,
-  params: Record<string, string | string[]>,
-): string {
+function buildUrlFromParams(pattern: string, params: Record<string, string | string[]>): string {
   const parts = pattern.split("/").filter(Boolean);
   const result: string[] = [];
 
@@ -548,7 +535,9 @@ async function resolveParentParams(
   // at each level of the path hierarchy.
   type ParentSegment = {
     params: string[];
-    generateStaticParams: (opts: { params: Record<string, string | string[]> }) => Promise<Record<string, string | string[]>[]>;
+    generateStaticParams: (opts: {
+      params: Record<string, string | string[]>;
+    }) => Promise<Record<string, string | string[]>[]>;
   };
 
   const parentSegments: ParentSegment[] = [];

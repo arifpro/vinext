@@ -1,19 +1,47 @@
 /**
- * App Router dev server handler.
+ * App Router RSC entry generator.
  *
- * This module generates virtual entry points for the RSC/SSR/browser
- * environments that @vitejs/plugin-rsc manages. The RSC entry does
- * route matching and renders the component tree, then delegates to
- * the SSR entry for HTML generation.
+ * Generates the virtual RSC entry module for the App Router.
+ * The RSC entry does route matching and renders the component tree,
+ * then delegates to the SSR entry for HTML generation.
+ *
+ * Previously housed in server/app-dev-server.ts.
  */
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import type { AppRoute } from "../routing/app-router.js";
-import type { MetadataFileRoute } from "./metadata-routes.js";
-import type { NextRedirect, NextRewrite, NextHeader } from "../config/next-config.js";
-import { generateDevOriginCheckCode } from "./dev-origin-check.js";
-import { generateSafeRegExpCode, generateMiddlewareMatcherCode, generateNormalizePathCode } from "./middleware-codegen.js";
-import { isProxyFile } from "./middleware.js";
+import type { MetadataFileRoute } from "../server/metadata-routes.js";
+import type {
+  NextRedirect,
+  NextRewrite,
+  NextHeader,
+  NextI18nConfig,
+} from "../config/next-config.js";
+import { generateDevOriginCheckCode } from "../server/dev-origin-check.js";
+import {
+  generateSafeRegExpCode,
+  generateMiddlewareMatcherCode,
+  generateNormalizePathCode,
+  generateRouteMatchNormalizationCode,
+} from "../server/middleware-codegen.js";
+import { isProxyFile } from "../server/middleware.js";
+
+// Pre-computed absolute paths for generated-code imports. The virtual RSC
+// entry can't use relative imports (it has no real file location), so we
+// resolve these at code-generation time and embed them as absolute paths.
+const configMatchersPath = fileURLToPath(
+  new URL("../config/config-matchers.js", import.meta.url),
+).replace(/\\/g, "/");
+const requestPipelinePath = fileURLToPath(
+  new URL("../server/request-pipeline.js", import.meta.url),
+).replace(/\\/g, "/");
+const requestContextShimPath = fileURLToPath(
+  new URL("../shims/request-context.js", import.meta.url),
+).replace(/\\/g, "/");
+const routeTriePath = fileURLToPath(new URL("../routing/route-trie.js", import.meta.url)).replace(
+  /\\/g,
+  "/",
+);
 
 /**
  * Resolved config options relevant to App Router request handling.
@@ -29,8 +57,12 @@ export interface AppRouterConfig {
   headers?: NextHeader[];
   /** Extra origins allowed for server action CSRF checks (from experimental.serverActions.allowedOrigins). */
   allowedOrigins?: string[];
-  /** Extra origins allowed for dev server access (from serverActionsAllowedOrigins or custom config). */
+  /** Extra origins allowed for dev server access (from allowedDevOrigins). */
   allowedDevOrigins?: string[];
+  /** Body size limit for server actions in bytes (from experimental.serverActions.bodySizeLimit). */
+  bodySizeLimit?: number;
+  /** Internationalization routing config for middleware matcher locale handling. */
+  i18n?: NextI18nConfig | null;
 }
 
 /**
@@ -57,6 +89,8 @@ export function generateRscEntry(
   const rewrites = config?.rewrites ?? { beforeFiles: [], afterFiles: [], fallback: [] };
   const headers = config?.headers ?? [];
   const allowedOrigins = config?.allowedOrigins ?? [];
+  const bodySizeLimit = config?.bodySizeLimit ?? 1 * 1024 * 1024;
+  const i18nConfig = config?.i18n ?? null;
   // Build import map for all page and layout files
   const imports: string[] = [];
   const importMap: Map<string, string> = new Map();
@@ -79,9 +113,14 @@ export function generateRscEntry(
     for (const tmpl of route.templates) getImportVar(tmpl);
     if (route.loadingPath) getImportVar(route.loadingPath);
     if (route.errorPath) getImportVar(route.errorPath);
-    if (route.layoutErrorPaths) for (const ep of route.layoutErrorPaths) { if (ep) getImportVar(ep); }
+    if (route.layoutErrorPaths)
+      for (const ep of route.layoutErrorPaths) {
+        if (ep) getImportVar(ep);
+      }
     if (route.notFoundPath) getImportVar(route.notFoundPath);
-    for (const nfp of route.notFoundPaths || []) { if (nfp) getImportVar(nfp); }
+    for (const nfp of route.notFoundPaths || []) {
+      if (nfp) getImportVar(nfp);
+    }
     if (route.forbiddenPath) getImportVar(route.forbiddenPath);
     if (route.unauthorizedPath) getImportVar(route.unauthorizedPath);
     // Register parallel slot modules
@@ -102,7 +141,7 @@ export function generateRscEntry(
   const routeEntries = routes.map((route) => {
     const layoutVars = route.layouts.map((l) => getImportVar(l));
     const templateVars = route.templates.map((t) => getImportVar(t));
-    const notFoundVars = (route.notFoundPaths || []).map((nf) => nf ? getImportVar(nf) : "null");
+    const notFoundVars = (route.notFoundPaths || []).map((nf) => (nf ? getImportVar(nf) : "null"));
     const slotEntries = route.parallelSlots.map((slot) => {
       const interceptEntries = slot.interceptingRoutes.map((ir) => {
         return `        {
@@ -124,15 +163,19 @@ ${interceptEntries.join(",\n")}
         ],
       }`;
     });
-    const layoutErrorVars = (route.layoutErrorPaths || []).map((ep) => ep ? getImportVar(ep) : "null");
+    const layoutErrorVars = (route.layoutErrorPaths || []).map((ep) =>
+      ep ? getImportVar(ep) : "null",
+    );
     return `  {
     pattern: ${JSON.stringify(route.pattern)},
+    patternParts: ${JSON.stringify(route.patternParts)},
     isDynamic: ${route.isDynamic},
     params: ${JSON.stringify(route.params)},
     page: ${route.pagePath ? getImportVar(route.pagePath) : "null"},
     routeHandler: ${route.routePath ? getImportVar(route.routePath) : "null"},
     layouts: [${layoutVars.join(", ")}],
-    layoutSegmentDepths: ${JSON.stringify(route.layoutSegmentDepths)},
+    routeSegments: ${JSON.stringify(route.routeSegments)},
+    layoutTreePositions: ${JSON.stringify(route.layoutTreePositions)},
     templates: [${templateVars.join(", ")}],
     errors: [${layoutErrorVars.join(", ")}],
     slots: {
@@ -149,18 +192,12 @@ ${slotEntries.join(",\n")}
 
   // Find root not-found/forbidden/unauthorized pages and root layouts for global error handling
   const rootRoute = routes.find((r) => r.pattern === "/");
-  const rootNotFoundVar = rootRoute?.notFoundPath
-    ? getImportVar(rootRoute.notFoundPath)
-    : null;
-  const rootForbiddenVar = rootRoute?.forbiddenPath
-    ? getImportVar(rootRoute.forbiddenPath)
-    : null;
+  const rootNotFoundVar = rootRoute?.notFoundPath ? getImportVar(rootRoute.notFoundPath) : null;
+  const rootForbiddenVar = rootRoute?.forbiddenPath ? getImportVar(rootRoute.forbiddenPath) : null;
   const rootUnauthorizedVar = rootRoute?.unauthorizedPath
     ? getImportVar(rootRoute.unauthorizedPath)
     : null;
-  const rootLayoutVars = rootRoute
-    ? rootRoute.layouts.map((l) => getImportVar(l))
-    : [];
+  const rootLayoutVars = rootRoute ? rootRoute.layouts.map((l) => getImportVar(l)) : [];
 
   // Global error boundary (app/global-error.tsx)
   const globalErrorVar = globalErrorPath ? getImportVar(globalErrorPath) : null;
@@ -215,16 +252,20 @@ import {
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createElement, Suspense, Fragment } from "react";
 import { setNavigationContext as _setNavigationContextOrig, getNavigationContext as _getNavigationContext } from "next/navigation";
-import { setHeadersContext, headersContextFromRequest, getDraftModeCookieHeader, getAndClearPendingCookies, consumeDynamicUsage, markDynamicUsage, runWithHeadersContext, applyMiddlewareRequestHeaders, getHeadersContext } from "next/headers";
-import { NextRequest } from "next/server";
+import { setHeadersContext, headersContextFromRequest, getDraftModeCookieHeader, getAndClearPendingCookies, consumeDynamicUsage, markDynamicUsage, runWithHeadersContext, applyMiddlewareRequestHeaders, getHeadersContext, setHeadersAccessPhase } from "next/headers";
+import { NextRequest, NextFetchEvent } from "next/server";
 import { ErrorBoundary, NotFoundBoundary } from "vinext/error-boundary";
 import { LayoutSegmentProvider } from "vinext/layout-segment-context";
 import { MetadataHead, mergeMetadata, resolveModuleMetadata, ViewportHead, mergeViewport, resolveModuleViewport } from "vinext/metadata";
 ${middlewarePath ? `import * as middlewareModule from ${JSON.stringify(middlewarePath.replace(/\\/g, "/"))};` : ""}
 ${instrumentationPath ? `import * as _instrumentation from ${JSON.stringify(instrumentationPath.replace(/\\/g, "/"))};` : ""}
-${effectiveMetaRoutes.length > 0 ? `import { sitemapToXml, robotsToText, manifestToJson } from ${JSON.stringify(fileURLToPath(new URL("./metadata-routes.js", import.meta.url)).replace(/\\/g, "/"))};` : ""}
-import { _consumeRequestScopedCacheLife, _runWithCacheState } from "next/cache";
-import { runWithFetchCache } from "vinext/fetch-cache";
+${effectiveMetaRoutes.length > 0 ? `import { sitemapToXml, robotsToText, manifestToJson } from ${JSON.stringify(fileURLToPath(new URL("../server/metadata-routes.js", import.meta.url)).replace(/\\/g, "/"))};` : ""}
+import { requestContextFromRequest, normalizeHost, matchRedirect, matchRewrite, matchHeaders, isExternalUrl, proxyExternalRequest, sanitizeDestination } from ${JSON.stringify(configMatchersPath)};
+import { validateCsrfOrigin, validateImageUrl, guardProtocolRelativeUrl, hasBasePath, stripBasePath, normalizeTrailingSlash, processMiddlewareHeaders } from ${JSON.stringify(requestPipelinePath)};
+import { _consumeRequestScopedCacheLife, _runWithCacheState, getCacheHandler } from "next/cache";
+import { runWithExecutionContext as _runWithExecutionContext, getRequestExecutionContext as _getRequestExecutionContext } from ${JSON.stringify(requestContextShimPath)};
+import { getCollectedFetchTags, runWithFetchCache } from "vinext/fetch-cache";
+import { buildRouteTrie as _buildRouteTrie, trieMatch as _trieMatch } from ${JSON.stringify(routeTriePath)};
 import { runWithPrivateCache as _runWithPrivateCache } from "vinext/cache-runtime";
 // Import server-only state module to register ALS-backed accessors.
 import { runWithNavigationContext as _runWithNavigationContext } from "vinext/navigation-state";
@@ -260,7 +301,94 @@ function setNavigationContext(ctx) {
 // ISR cache is disabled in dev mode — every request re-renders fresh,
 // matching Next.js dev behavior. Cache-Control headers are still emitted
 // based on export const revalidate for testing purposes.
-// Production ISR is handled by prod-server.ts and the Cloudflare worker entry.
+// Production ISR uses the MemoryCacheHandler (or configured KV handler).
+//
+// These helpers are inlined instead of imported from isr-cache.js because
+// the virtual RSC entry module runs in the RSC Vite environment which
+// cannot use dynamic imports at the module-evaluation level for server-only
+// modules, and direct imports must use the pre-computed absolute paths.
+async function __isrGet(key) {
+  const handler = getCacheHandler();
+  const result = await handler.get(key);
+  if (!result || !result.value) return null;
+  return { value: result, isStale: result.cacheState === "stale" };
+}
+async function __isrSet(key, data, revalidateSeconds, tags) {
+  const handler = getCacheHandler();
+  await handler.set(key, data, { revalidate: revalidateSeconds, tags: Array.isArray(tags) ? tags : [] });
+}
+function __pageCacheTags(pathname, extraTags) {
+  const tags = [pathname, "_N_T_" + pathname];
+  if (Array.isArray(extraTags)) {
+    for (const tag of extraTags) {
+      if (!tags.includes(tag)) tags.push(tag);
+    }
+  }
+  return tags;
+}
+// Note: cache entries are written with \`headers: undefined\`. Next.js stores
+// response headers (e.g. set-cookie from cookies().set() during render) in the
+// cache entry so they can be replayed on HIT. We don't do this because:
+//   1. Pages that call cookies().set() during render trigger dynamicUsedDuringRender,
+//      which opts them out of ISR caching before we reach the write path.
+//   2. Custom response headers set via next/headers are not yet captured separately
+//      from the live Response object in vinext's server pipeline.
+// In practice this means ISR-cached responses won't replay render-time set-cookie
+// headers — but that case is already prevented by the dynamic-usage opt-out.
+// TODO: capture render-time response headers for full Next.js parity.
+const __pendingRegenerations = new Map();
+function __triggerBackgroundRegeneration(key, renderFn) {
+  if (__pendingRegenerations.has(key)) return;
+  const promise = renderFn()
+    .catch((err) => console.error("[vinext] ISR regen failed for " + key + ":", err))
+    .finally(() => __pendingRegenerations.delete(key));
+  __pendingRegenerations.set(key, promise);
+  const ctx = _getRequestExecutionContext();
+  if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(promise);
+}
+// HTML and RSC are stored under separate keys — matching Next.js's file-system
+// layout (.html / .rsc) — so each request type reads and writes its own key
+// independently with no races or partial-entry sentinels.
+//
+// Key format: "app:<buildId>:<pathname>:<suffix>"
+// Long-pathname fallback: "app:<buildId>:__hash:<fnv1a64(pathname)>:<suffix>"
+// Without buildId (should not happen in production): "app:<pathname>:<suffix>"
+// The 200-char threshold keeps the full key well under Cloudflare KV's 512-byte limit
+// even after adding the build ID and suffix. FNV-1a 64 is used for the hash (two
+// 32-bit rounds) to give a ~64-bit output with negligible collision probability for
+// realistic pathname lengths.
+// Keep prefix construction and hashing logic in sync with isrCacheKey() in server/isr-cache.ts.
+function __isrFnv1a64(s) {
+  // h1 uses the standard FNV-1a 32-bit offset basis (0x811c9dc5).
+  let h1 = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) { h1 ^= s.charCodeAt(i); h1 = (h1 * 0x01000193) >>> 0; }
+  // h2 uses a different seed (0x050c5d1f — the FNV-1a hash of the string "vinext")
+  // so the two rounds are independently seeded and their outputs are decorrelated.
+  // Concatenating two independently-seeded 32-bit FNV-1a hashes gives an effective
+  // 64-bit hash. A random non-standard seed would also work; we derive it from a
+  // fixed string so the choice is auditable and deterministic across rebuilds.
+  let h2 = 0x050c5d1f;
+  for (let i = 0; i < s.length; i++) { h2 ^= s.charCodeAt(i); h2 = (h2 * 0x01000193) >>> 0; }
+  return h1.toString(36) + h2.toString(36);
+}
+function __isrCacheKey(pathname, suffix) {
+  const normalized = pathname === "/" ? "/" : pathname.replace(/\\/$/, "");
+  // __VINEXT_BUILD_ID is replaced at compile time by Vite's define plugin.
+  const buildId = process.env.__VINEXT_BUILD_ID;
+  const prefix = buildId ? "app:" + buildId : "app";
+  const key = prefix + ":" + normalized + ":" + suffix;
+  if (key.length <= 200) return key;
+  // Pathname too long — hash it to keep under KV's 512-byte key limit.
+  return prefix + ":__hash:" + __isrFnv1a64(normalized) + ":" + suffix;
+}
+function __isrHtmlKey(pathname) { return __isrCacheKey(pathname, "html"); }
+function __isrRscKey(pathname) { return __isrCacheKey(pathname, "rsc"); }
+// Verbose cache logging — opt in with NEXT_PRIVATE_DEBUG_CACHE=1.
+// Matches the env var Next.js uses for its own cache debug output so operators
+// have a single knob for all cache tracing.
+const __isrDebug = process.env.NEXT_PRIVATE_DEBUG_CACHE
+  ? console.debug.bind(console, "[vinext] ISR:")
+  : undefined;
 
 // Normalize null-prototype objects from matchPattern() into thenable objects
 // that work both as Promises (for Next.js 15+ async params) and as plain
@@ -274,6 +402,38 @@ function setNavigationContext(ctx) {
 function makeThenableParams(obj) {
   const plain = { ...obj };
   return Object.assign(Promise.resolve(plain), plain);
+}
+
+// Resolve route tree segments to actual values using matched params.
+// Dynamic segments like [id] are replaced with param values, catch-all
+// segments like [...slug] are joined with "/", and route groups are kept as-is.
+function __resolveChildSegments(routeSegments, treePosition, params) {
+  var raw = routeSegments.slice(treePosition);
+  var result = [];
+  for (var j = 0; j < raw.length; j++) {
+    var seg = raw[j];
+    // Optional catch-all: [[...param]]
+    if (seg.indexOf("[[...") === 0 && seg.charAt(seg.length - 1) === "]" && seg.charAt(seg.length - 2) === "]") {
+      var pn = seg.slice(5, -2);
+      var v = params[pn];
+      // Skip empty optional catch-all (e.g., visiting /blog on [[...slug]] route)
+      if (Array.isArray(v) && v.length === 0) continue;
+      if (v == null) continue;
+      result.push(Array.isArray(v) ? v.join("/") : v);
+    // Catch-all: [...param]
+    } else if (seg.indexOf("[...") === 0 && seg.charAt(seg.length - 1) === "]") {
+      var pn2 = seg.slice(4, -1);
+      var v2 = params[pn2];
+      result.push(Array.isArray(v2) ? v2.join("/") : (v2 || seg));
+    // Dynamic: [param]
+    } else if (seg.charAt(0) === "[" && seg.charAt(seg.length - 1) === "]" && seg.indexOf(".") === -1) {
+      var pn3 = seg.slice(1, -1);
+      result.push(params[pn3] || seg);
+    } else {
+      result.push(seg);
+    }
+  }
+  return result;
 }
 
 // djb2 hash — matches Next.js's stringHash for digest generation.
@@ -324,7 +484,7 @@ function __sanitizeErrorForClient(error) {
 // thrown during RSC streaming (e.g. inside Suspense boundaries).
 // For non-navigation errors in production, generates a digest hash so the
 // error can be correlated with server logs without leaking details.
-function rscOnError(error) {
+function rscOnError(error, requestInfo, errorContext) {
   if (error && typeof error === "object" && "digest" in error) {
     return String(error.digest);
   }
@@ -370,6 +530,16 @@ function rscOnError(error) {
     return undefined;
   }
 
+  if (requestInfo && errorContext && error) {
+    _reportRequestError(
+      error instanceof Error ? error : new Error(String(error)),
+      requestInfo,
+      errorContext,
+    ).catch((reportErr) => {
+      console.error("[vinext] Failed to report render error:", reportErr);
+    });
+  }
+
   // In production, generate a digest hash for non-navigation errors
   if (process.env.NODE_ENV === "production" && error) {
     const msg = error instanceof Error ? error.message : String(error);
@@ -379,28 +549,63 @@ function rscOnError(error) {
   return undefined;
 }
 
+function createRscOnErrorHandler(request, pathname, routePath) {
+  const requestInfo = {
+    path: pathname,
+    method: request.method,
+    headers: Object.fromEntries(request.headers.entries()),
+  };
+  const errorContext = {
+    routerKind: "App Router",
+    routePath: routePath || pathname,
+    routeType: "render",
+  };
+  return function(error) {
+    return rscOnError(error, requestInfo, errorContext);
+  };
+}
+
 ${imports.join("\n")}
 
-${instrumentationPath ? `// Run instrumentation register() once at module evaluation time — before any
-// requests are handled. This runs inside the Worker process (or RSC environment),
-// which is exactly where request handling happens. Matches Next.js semantics:
-// register() is called once on startup in the process that handles requests.
-if (typeof _instrumentation.register === "function") {
-  await _instrumentation.register();
+${
+  instrumentationPath
+    ? `// Run instrumentation register() exactly once, lazily on the first request.
+// Previously this was a top-level await, which blocked the entire module graph
+// from finishing initialization until register() resolved — adding that latency
+// to every cold start. Moving it here preserves the "runs before any request is
+// handled" guarantee while not blocking V8 isolate initialization.
+// On Cloudflare Workers, module evaluation happens synchronously in the isolate
+// startup phase; a top-level await extends that phase and increases cold-start
+// wall time for all requests, not just the first.
+let __instrumentationInitialized = false;
+let __instrumentationInitPromise = null;
+async function __ensureInstrumentation() {
+  if (__instrumentationInitialized) return;
+  if (__instrumentationInitPromise) return __instrumentationInitPromise;
+  __instrumentationInitPromise = (async () => {
+    if (typeof _instrumentation.register === "function") {
+      await _instrumentation.register();
+    }
+    // Store the onRequestError handler on globalThis so it is visible to
+    // reportRequestError() (imported as _reportRequestError above) regardless
+    // of which Vite environment module graph it is called from. With
+    // @vitejs/plugin-rsc the RSC and SSR environments run in the same Node.js
+    // process and share globalThis. With @cloudflare/vite-plugin everything
+    // runs inside the Worker so globalThis is the Worker's global — also correct.
+    if (typeof _instrumentation.onRequestError === "function") {
+      globalThis.__VINEXT_onRequestErrorHandler__ = _instrumentation.onRequestError;
+    }
+    __instrumentationInitialized = true;
+  })();
+  return __instrumentationInitPromise;
+}`
+    : ""
 }
-// Store the onRequestError handler on globalThis so it is visible to
-// reportRequestError() (imported as _reportRequestError above) regardless
-// of which Vite environment module graph it is called from. With
-// @vitejs/plugin-rsc the RSC and SSR environments run in the same Node.js
-// process and share globalThis. With @cloudflare/vite-plugin everything
-// runs inside the Worker so globalThis is the Worker's global — also correct.
-if (typeof _instrumentation.onRequestError === "function") {
-  globalThis.__VINEXT_onRequestErrorHandler__ = _instrumentation.onRequestError;
-}` : ""}
 
 const routes = [
 ${routeEntries.join(",\n")}
 ];
+const _routeTrie = _buildRouteTrie(routes);
 
 const metadataRoutes = [
 ${metaRouteEntries.join(",\n")}
@@ -437,16 +642,26 @@ async function renderHTTPAccessFallbackPage(route, statusCode, isRscRequest, req
 
   // Resolve metadata and viewport from parent layouts so that not-found/error
   // pages inherit title, description, OG tags etc. — matching Next.js behavior.
-  const metadataList = [];
-  const viewportList = [];
-  for (const layoutMod of layouts) {
-    if (layoutMod) {
-      const meta = await resolveModuleMetadata(layoutMod);
-      if (meta) metadataList.push(meta);
-      const vp = await resolveModuleViewport(layoutMod);
-      if (vp) viewportList.push(vp);
-    }
+  // Build the serial parent chain for layout metadata (same as buildPageElement).
+  const _filteredLayouts = layouts.filter(Boolean);
+  const _fallbackParams = opts?.matchedParams ?? route?.params ?? {};
+  const _layoutMetaPromises = [];
+  let _accumulatedMeta = Promise.resolve({});
+  for (let _i = 0; _i < _filteredLayouts.length; _i++) {
+    const _parentForLayout = _accumulatedMeta;
+    const _metaP = resolveModuleMetadata(_filteredLayouts[_i], _fallbackParams, undefined, _parentForLayout)
+      .catch((err) => { console.error("[vinext] Layout generateMetadata() failed:", err); return null; });
+    _layoutMetaPromises.push(_metaP);
+    _accumulatedMeta = _metaP.then(async (_r) =>
+      _r ? mergeMetadata([await _parentForLayout, _r]) : await _parentForLayout
+    );
   }
+  const [_metaResults, _vpResults] = await Promise.all([
+    Promise.all(_layoutMetaPromises),
+    Promise.all(_filteredLayouts.map((mod) => resolveModuleViewport(mod, _fallbackParams).catch((err) => { console.error("[vinext] Layout generateViewport() failed:", err); return null; }))),
+  ]);
+  const metadataList = _metaResults.filter(Boolean);
+  const viewportList = _vpResults.filter(Boolean);
   const resolvedMetadata = metadataList.length > 0 ? mergeMetadata(metadataList) : null;
   const resolvedViewport = mergeViewport(viewportList);
 
@@ -469,16 +684,22 @@ async function renderHTTPAccessFallbackPage(route, statusCode, isRscRequest, req
     // We wrap each layout with LayoutSegmentProvider and add GlobalErrorBoundary
     // to match the wrapping order in buildPageElement(), ensuring smooth
     // client-side tree reconciliation.
-    const layoutDepths = route?.layoutSegmentDepths;
+    const _treePositions = route?.layoutTreePositions;
+    const _routeSegs = route?.routeSegments || [];
+    const _fallbackParams = opts?.matchedParams ?? route?.params ?? {};
+    const _asyncFallbackParams = makeThenableParams(_fallbackParams);
     for (let i = layouts.length - 1; i >= 0; i--) {
       const LayoutComponent = layouts[i]?.default;
       if (LayoutComponent) {
-        element = createElement(LayoutComponent, { children: element });
-        const layoutDepth = layoutDepths ? layoutDepths[i] : 0;
-        element = createElement(LayoutSegmentProvider, { depth: layoutDepth }, element);
+        element = createElement(LayoutComponent, { children: element, params: _asyncFallbackParams });
+        const _tp = _treePositions ? _treePositions[i] : 0;
+        const _cs = __resolveChildSegments(_routeSegs, _tp, _fallbackParams);
+        element = createElement(LayoutSegmentProvider, { childSegments: _cs }, element);
       }
     }
-    ${globalErrorVar ? `
+    ${
+      globalErrorVar
+        ? `
     const _GlobalErrorComponent = ${globalErrorVar}.default;
     if (_GlobalErrorComponent) {
       element = createElement(ErrorBoundary, {
@@ -486,10 +707,22 @@ async function renderHTTPAccessFallbackPage(route, statusCode, isRscRequest, req
         children: element,
       });
     }
-    ` : ""}
-    const rscStream = renderToReadableStream(element, { onError: rscOnError });
-    setHeadersContext(null);
-    setNavigationContext(null);
+    `
+        : ""
+    }
+    const _pathname = new URL(request.url).pathname;
+    const onRenderError = createRscOnErrorHandler(
+      request,
+      _pathname,
+      route?.pattern ?? _pathname,
+    );
+    const rscStream = renderToReadableStream(element, { onError: onRenderError });
+    // Do NOT clear context here — the RSC stream is consumed lazily by the client.
+    // Clearing context now would cause async server components (e.g. NextIntlClientProviderServer)
+    // that run during stream consumption to see null headers/navigation context and throw,
+    // resulting in missing provider context on the client (e.g. next-intl useTranslations fails
+    // with "context from NextIntlClientProvider was not found").
+    // Context is cleared naturally when the ALS scope from runWithHeadersContext unwinds.
     return new Response(rscStream, {
       status: statusCode,
       headers: { "Content-Type": "text/x-component; charset=utf-8", "Vary": "RSC, Accept" },
@@ -497,13 +730,21 @@ async function renderHTTPAccessFallbackPage(route, statusCode, isRscRequest, req
   }
   // For HTML (full page load) responses, wrap with layouts only (no client-side
   // wrappers needed since SSR generates the complete HTML document).
+  const _fallbackParamsHtml = opts?.matchedParams ?? route?.params ?? {};
+  const _asyncFallbackParamsHtml = makeThenableParams(_fallbackParamsHtml);
   for (let i = layouts.length - 1; i >= 0; i--) {
     const LayoutComponent = layouts[i]?.default;
     if (LayoutComponent) {
-      element = createElement(LayoutComponent, { children: element });
+      element = createElement(LayoutComponent, { children: element, params: _asyncFallbackParamsHtml });
     }
   }
-  const rscStream = renderToReadableStream(element, { onError: rscOnError });
+  const _pathname = new URL(request.url).pathname;
+  const onRenderError = createRscOnErrorHandler(
+    request,
+    _pathname,
+    route?.pattern ?? _pathname,
+  );
+  const rscStream = renderToReadableStream(element, { onError: onRenderError });
   // Collect font data from RSC environment
   const fontData = {
     links: _getSSRFontLinks(),
@@ -524,8 +765,8 @@ async function renderHTTPAccessFallbackPage(route, statusCode, isRscRequest, req
 }
 
 /** Convenience: render a not-found page (404) */
-async function renderNotFoundPage(route, isRscRequest, request) {
-  return renderHTTPAccessFallbackPage(route, 404, isRscRequest, request);
+async function renderNotFoundPage(route, isRscRequest, request, matchedParams) {
+  return renderHTTPAccessFallbackPage(route, 404, isRscRequest, request, { matchedParams });
 }
 
 /**
@@ -535,10 +776,11 @@ async function renderNotFoundPage(route, isRscRequest, request) {
  * Next.js returns HTTP 200 when error.tsx catches an error (the error is "handled"
  * by the boundary). This matches that behavior intentionally.
  */
-async function renderErrorBoundaryPage(route, error, isRscRequest, request) {
+async function renderErrorBoundaryPage(route, error, isRscRequest, request, matchedParams) {
   // Resolve the error boundary component: leaf error.tsx first, then walk per-layout
   // errors from innermost to outermost (matching ancestor inheritance), then global-error.tsx.
   let ErrorComponent = route?.error?.default ?? null;
+  let _isGlobalError = false;
   if (!ErrorComponent && route?.errors) {
     for (let i = route.errors.length - 1; i >= 0; i--) {
       if (route.errors[i]?.default) {
@@ -547,7 +789,16 @@ async function renderErrorBoundaryPage(route, error, isRscRequest, request) {
       }
     }
   }
-  ErrorComponent = ErrorComponent${globalErrorVar ? ` ?? ${globalErrorVar}?.default` : ""};
+  ${
+    globalErrorVar
+      ? `
+  if (!ErrorComponent) {
+    ErrorComponent = ${globalErrorVar}?.default ?? null;
+    _isGlobalError = !!ErrorComponent;
+  }
+  `
+      : ""
+  }
   if (!ErrorComponent) return null;
 
   const rawError = error instanceof Error ? error : new Error(String(error));
@@ -562,46 +813,78 @@ async function renderErrorBoundaryPage(route, error, isRscRequest, request) {
   let element = createElement(ErrorComponent, {
     error: errorObj,
   });
-  const layouts = route?.layouts ?? rootLayouts;
-  if (isRscRequest) {
-    // For RSC requests (client-side navigation), wrap with the same component
-    // wrappers that buildPageElement() uses (LayoutSegmentProvider, GlobalErrorBoundary).
-    // This ensures React can reconcile the tree without destroying the DOM.
-    // Same rationale as renderHTTPAccessFallbackPage — see comment there.
-    const layoutDepths = route?.layoutSegmentDepths;
-    for (let i = layouts.length - 1; i >= 0; i--) {
-      const LayoutComponent = layouts[i]?.default;
-      if (LayoutComponent) {
-        element = createElement(LayoutComponent, { children: element });
-        const layoutDepth = layoutDepths ? layoutDepths[i] : 0;
-        element = createElement(LayoutSegmentProvider, { depth: layoutDepth }, element);
+
+  // global-error.tsx provides its own <html> and <body> (it replaces the root
+  // layout). Skip layout wrapping when rendering it to avoid double <html> tags.
+  if (!_isGlobalError) {
+    const layouts = route?.layouts ?? rootLayouts;
+    if (isRscRequest) {
+      // For RSC requests (client-side navigation), wrap with the same component
+      // wrappers that buildPageElement() uses (LayoutSegmentProvider, GlobalErrorBoundary).
+      // This ensures React can reconcile the tree without destroying the DOM.
+      // Same rationale as renderHTTPAccessFallbackPage — see comment there.
+      const _errTreePositions = route?.layoutTreePositions;
+      const _errRouteSegs = route?.routeSegments || [];
+      const _errParams = matchedParams ?? route?.params ?? {};
+      const _asyncErrParams = makeThenableParams(_errParams);
+      for (let i = layouts.length - 1; i >= 0; i--) {
+        const LayoutComponent = layouts[i]?.default;
+        if (LayoutComponent) {
+          element = createElement(LayoutComponent, { children: element, params: _asyncErrParams });
+          const _etp = _errTreePositions ? _errTreePositions[i] : 0;
+          const _ecs = __resolveChildSegments(_errRouteSegs, _etp, _errParams);
+          element = createElement(LayoutSegmentProvider, { childSegments: _ecs }, element);
+        }
+      }
+      ${
+        globalErrorVar
+          ? `
+      const _ErrGlobalComponent = ${globalErrorVar}.default;
+      if (_ErrGlobalComponent) {
+        element = createElement(ErrorBoundary, {
+          fallback: _ErrGlobalComponent,
+          children: element,
+        });
+      }
+      `
+          : ""
+      }
+    } else {
+      // For HTML (full page load) responses, wrap with layouts only.
+      const _errParamsHtml = matchedParams ?? route?.params ?? {};
+      const _asyncErrParamsHtml = makeThenableParams(_errParamsHtml);
+      for (let i = layouts.length - 1; i >= 0; i--) {
+        const LayoutComponent = layouts[i]?.default;
+        if (LayoutComponent) {
+          element = createElement(LayoutComponent, { children: element, params: _asyncErrParamsHtml });
+        }
       }
     }
-    ${globalErrorVar ? `
-    const _ErrGlobalComponent = ${globalErrorVar}.default;
-    if (_ErrGlobalComponent) {
-      element = createElement(ErrorBoundary, {
-        fallback: _ErrGlobalComponent,
-        children: element,
-      });
-    }
-    ` : ""}
-    const rscStream = renderToReadableStream(element, { onError: rscOnError });
-    setHeadersContext(null);
-    setNavigationContext(null);
+  }
+
+  const _pathname = new URL(request.url).pathname;
+  const onRenderError = createRscOnErrorHandler(
+    request,
+    _pathname,
+    route?.pattern ?? _pathname,
+  );
+
+  if (isRscRequest) {
+    const rscStream = renderToReadableStream(element, { onError: onRenderError });
+    // Do NOT clear context here — the RSC stream is consumed lazily by the client.
+    // Clearing context now would cause async server components (e.g. NextIntlClientProviderServer)
+    // that run during stream consumption to see null headers/navigation context and throw,
+    // resulting in missing provider context on the client (e.g. next-intl useTranslations fails
+    // with "context from NextIntlClientProvider was not found").
+    // Context is cleared naturally when the ALS scope from runWithHeadersContext unwinds.
     return new Response(rscStream, {
       status: 200,
       headers: { "Content-Type": "text/x-component; charset=utf-8", "Vary": "RSC, Accept" },
     });
   }
-  // For HTML (full page load) responses, wrap with layouts only.
-  for (let i = layouts.length - 1; i >= 0; i--) {
-    const LayoutComponent = layouts[i]?.default;
-    if (LayoutComponent) {
-      element = createElement(LayoutComponent, { children: element });
-    }
-  }
-  const rscStream = renderToReadableStream(element, { onError: rscOnError });
+
+  // HTML (full page load) response — render through RSC → SSR pipeline
+  const rscStream = renderToReadableStream(element, { onError: onRenderError });
   // Collect font data from RSC environment so error pages include font styles
   const fontData = {
     links: _getSSRFontLinks(),
@@ -621,26 +904,23 @@ async function renderErrorBoundaryPage(route, error, isRscRequest, request) {
   });
 }
 
-function matchRoute(url, routes) {
+function matchRoute(url) {
   const pathname = url.split("?")[0];
   let normalizedUrl = pathname === "/" ? "/" : pathname.replace(/\\/$/, "");
    // NOTE: Do NOT decodeURIComponent here. The caller is responsible for decoding
    // the pathname exactly once at the request entry point. Decoding again here
    // would cause inconsistent path matching between middleware and routing.
-  for (const route of routes) {
-    const params = matchPattern(normalizedUrl, route.pattern);
-    if (params !== null) return { route, params };
-  }
-  return null;
+  const urlParts = normalizedUrl.split("/").filter(Boolean);
+  return _trieMatch(_routeTrie, urlParts);
 }
 
-function matchPattern(url, pattern) {
-  const urlParts = url.split("/").filter(Boolean);
-  const patternParts = pattern.split("/").filter(Boolean);
+// matchPattern is kept for findIntercept (linear scan over small interceptLookup array).
+function matchPattern(urlParts, patternParts) {
   const params = Object.create(null);
   for (let i = 0; i < patternParts.length; i++) {
     const pp = patternParts[i];
     if (pp.endsWith("+")) {
+      if (i !== patternParts.length - 1) return null;
       const paramName = pp.slice(1, -1);
       const remaining = urlParts.slice(i);
       if (remaining.length === 0) return null;
@@ -648,6 +928,7 @@ function matchPattern(url, pattern) {
       return params;
     }
     if (pp.endsWith("*")) {
+      if (i !== patternParts.length - 1) return null;
       const paramName = pp.slice(1, -1);
       params[paramName] = urlParts.slice(i);
       return params;
@@ -676,6 +957,7 @@ for (let ri = 0; ri < routes.length; ri++) {
         sourceRouteIndex: ri,
         slotName,
         targetPattern: intercept.targetPattern,
+        targetPatternParts: intercept.targetPattern.split("/").filter(Boolean),
         page: intercept.page,
         params: intercept.params,
       });
@@ -688,8 +970,9 @@ for (let ri = 0; ri < routes.length; ri++) {
  * Returns the match info or null.
  */
 function findIntercept(pathname) {
+  const urlParts = pathname.split("/").filter(Boolean);
   for (const entry of interceptLookup) {
-    const params = matchPattern(pathname, entry.targetPattern);
+    const params = matchPattern(urlParts, entry.targetPatternParts);
     if (params !== null) {
       return { ...entry, matchedParams: params };
     }
@@ -703,23 +986,79 @@ async function buildPageElement(route, params, opts, searchParams) {
     return createElement("div", null, "Page has no default export");
   }
 
-  // Resolve metadata and viewport from layouts and page
-  const metadataList = [];
-  const viewportList = [];
-  for (const layoutMod of route.layouts) {
-    if (layoutMod) {
-      const meta = await resolveModuleMetadata(layoutMod, params);
-      if (meta) metadataList.push(meta);
-      const vp = await resolveModuleViewport(layoutMod, params);
-      if (vp) viewportList.push(vp);
-    }
+  // Resolve metadata and viewport from layouts and page.
+  //
+  // generateMetadata() accepts a "parent" (Promise of ResolvedMetadata) as its
+  // second argument (Next.js 13+). The parent resolves to the accumulated
+  // merged metadata of all ancestor segments, enabling patterns like:
+  //
+  //   const previousImages = (await parent).openGraph?.images ?? []
+  //   return { openGraph: { images: ['/new-image.jpg', ...previousImages] } }
+  //
+  // Next.js uses an eager-execution-with-serial-resolution approach:
+  // all generateMetadata() calls are kicked off concurrently, but each
+  // segment's "parent" promise resolves only after the preceding segment's
+  // metadata is resolved and merged. This preserves concurrency for I/O-bound
+  // work while guaranteeing that parent data is available when needed.
+  //
+  // We build a chain: layoutParentPromises[0] = Promise.resolve({}) (no parent
+  // for root layout), layoutParentPromises[i+1] resolves to merge(layouts[0..i]),
+  // and pageParentPromise resolves to merge(all layouts).
+  //
+  // IMPORTANT: Layout metadata errors are swallowed (.catch(() => null)) because
+  // a layout's generateMetadata() failing should not crash the page.
+  // Page metadata errors are NOT swallowed — if the page's generateMetadata()
+  // throws, the error propagates out of buildPageElement() so the caller can
+  // route it to the nearest error.tsx boundary (or global-error.tsx).
+  const layoutMods = route.layouts.filter(Boolean);
+
+  // Build the parent promise chain and kick off metadata resolution in one pass.
+  // Each layout module is called exactly once. layoutMetaPromises[i] is the
+  // promise for layout[i]'s own metadata result.
+  //
+  // All calls are kicked off immediately (concurrent I/O), but each layout's
+  // "parent" promise only resolves after the preceding layout's metadata is done.
+  const layoutMetaPromises = [];
+  let accumulatedMetaPromise = Promise.resolve({});
+  for (let i = 0; i < layoutMods.length; i++) {
+    const parentForThisLayout = accumulatedMetaPromise;
+    // Kick off this layout's metadata resolution now (concurrent with others).
+    const metaPromise = resolveModuleMetadata(layoutMods[i], params, undefined, parentForThisLayout)
+      .catch((err) => { console.error("[vinext] Layout generateMetadata() failed:", err); return null; });
+    layoutMetaPromises.push(metaPromise);
+    // Advance accumulator: resolves to merged(layouts[0..i]) once layout[i] is done.
+    accumulatedMetaPromise = metaPromise.then(async (result) =>
+      result ? mergeMetadata([await parentForThisLayout, result]) : await parentForThisLayout
+    );
   }
-  if (route.page) {
-    const pageMeta = await resolveModuleMetadata(route.page, params);
-    if (pageMeta) metadataList.push(pageMeta);
-    const pageVp = await resolveModuleViewport(route.page, params);
-    if (pageVp) viewportList.push(pageVp);
+  // Page's parent is the fully-accumulated layout metadata.
+  const pageParentPromise = accumulatedMetaPromise;
+
+  // Convert URLSearchParams → plain object so we can pass it to
+  // resolveModuleMetadata (which expects Record<string, string | string[]>).
+  // This same object is reused for pageProps.searchParams below.
+  const spObj = {};
+  let hasSearchParams = false;
+  if (searchParams && searchParams.forEach) {
+    searchParams.forEach(function(v, k) {
+      hasSearchParams = true;
+      if (k in spObj) {
+        spObj[k] = Array.isArray(spObj[k]) ? spObj[k].concat(v) : [spObj[k], v];
+      } else {
+        spObj[k] = v;
+      }
+    });
   }
+
+  const [layoutMetaResults, layoutVpResults, pageMeta, pageVp] = await Promise.all([
+    Promise.all(layoutMetaPromises),
+    Promise.all(layoutMods.map((mod) => resolveModuleViewport(mod, params).catch((err) => { console.error("[vinext] Layout generateViewport() failed:", err); return null; }))),
+    route.page ? resolveModuleMetadata(route.page, params, spObj, pageParentPromise) : Promise.resolve(null),
+    route.page ? resolveModuleViewport(route.page, params) : Promise.resolve(null),
+  ]);
+
+  const metadataList = [...layoutMetaResults.filter(Boolean), ...(pageMeta ? [pageMeta] : [])];
+  const viewportList = [...layoutVpResults.filter(Boolean), ...(pageVp ? [pageVp] : [])];
   const resolvedMetadata = metadataList.length > 0 ? mergeMetadata(metadataList) : null;
   const resolvedViewport = mergeViewport(viewportList);
 
@@ -730,17 +1069,10 @@ async function buildPageElement(route, params, opts, searchParams) {
   const asyncParams = makeThenableParams(params);
   const pageProps = { params: asyncParams };
   if (searchParams) {
-    const spObj = {};
-    let hasSearchParams = false;
-    if (searchParams.forEach) searchParams.forEach(function(v, k) {
-      hasSearchParams = true;
-      if (k in spObj) {
-        // Multi-value: promote to array (Next.js returns string[] for duplicate keys)
-        spObj[k] = Array.isArray(spObj[k]) ? spObj[k].concat(v) : [spObj[k], v];
-      } else {
-        spObj[k] = v;
-      }
-    });
+    // Always provide searchParams prop when the URL object is available, even
+    // when the query string is empty -- pages that do "await searchParams" need
+    // it to be a thenable rather than undefined.
+    pageProps.searchParams = makeThenableParams(spObj);
     // If the URL has query parameters, mark the page as dynamic.
     // In Next.js, only accessing the searchParams prop signals dynamic usage,
     // but a Proxy-based approach doesn't work here because React's RSC debug
@@ -750,9 +1082,12 @@ async function buildPageElement(route, params, opts, searchParams) {
     // approximation: pages with query params in the URL are almost always
     // dynamic, and this avoids false positives from React internals.
     if (hasSearchParams) markDynamicUsage();
-    pageProps.searchParams = makeThenableParams(spObj);
   }
   let element = createElement(PageComponent, pageProps);
+
+  // Wrap page with empty segment provider so useSelectedLayoutSegments()
+  // returns [] when called from inside a page component (leaf node).
+  element = createElement(LayoutSegmentProvider, { childSegments: [] }, element);
 
   // Add metadata + viewport head tags (React 19 hoists title/meta/link to <head>)
   // Next.js always injects charset and default viewport even when no metadata/viewport
@@ -904,18 +1239,28 @@ async function buildPageElement(route, params, opts, searchParams) {
       element = createElement(LayoutComponent, layoutProps);
 
       // Wrap the layout with LayoutSegmentProvider so useSelectedLayoutSegments()
-      // called INSIDE this layout knows its URL segment depth. The depth tells the
-      // hook how many URL segments are above this layout, so it returns only the
-      // segments below. We wrap the layout (not just children) because hooks are
-      // called from components rendered inside the layout's own JSX.
-      const layoutDepth = route.layoutSegmentDepths ? route.layoutSegmentDepths[i] : 0;
-      element = createElement(LayoutSegmentProvider, { depth: layoutDepth }, element);
+      // called INSIDE this layout gets the correct child segments. We resolve the
+      // route tree segments using actual param values and pass them through context.
+      // We wrap the layout (not just children) because hooks are called from
+      // components rendered inside the layout's own JSX.
+      const treePos = route.layoutTreePositions ? route.layoutTreePositions[i] : 0;
+      const childSegs = __resolveChildSegments(route.routeSegments || [], treePos, params);
+      element = createElement(LayoutSegmentProvider, { childSegments: childSegs }, element);
     }
   }
 
   // Wrap with global error boundary if app/global-error.tsx exists.
-  // This catches errors in the root layout itself.
-  ${globalErrorVar ? `
+  // This must be present in both HTML and RSC paths so the component tree
+  // structure matches — otherwise React reconciliation on client-side navigation
+  // would see a mismatched tree and destroy/recreate the DOM.
+  //
+  // For RSC requests (client-side nav), this provides error recovery on the client.
+  // For HTML requests (initial page load), the ErrorBoundary catches during SSR
+  // but produces double <html>/<body> (root layout + global-error). The request
+  // handler detects this via the rscOnError flag and re-renders without layouts.
+  ${
+    globalErrorVar
+      ? `
   const GlobalErrorComponent = ${globalErrorVar}.default;
   if (GlobalErrorComponent) {
     element = createElement(ErrorBoundary, {
@@ -923,7 +1268,9 @@ async function buildPageElement(route, params, opts, searchParams) {
       children: element,
     });
   }
-  ` : ""}
+  `
+      : ""
+  }
 
   return element;
 }
@@ -932,6 +1279,7 @@ ${middlewarePath ? generateMiddlewareMatcherCode("modern") : ""}
 
 const __basePath = ${JSON.stringify(bp)};
 const __trailingSlash = ${JSON.stringify(ts)};
+const __i18nConfig = ${JSON.stringify(i18nConfig)};
 const __configRedirects = ${JSON.stringify(redirects)};
 const __configRewrites = ${JSON.stringify(rewrites)};
 const __configHeaders = ${JSON.stringify(headers)};
@@ -939,168 +1287,19 @@ const __allowedOrigins = ${JSON.stringify(allowedOrigins)};
 
 ${generateDevOriginCheckCode(config?.allowedDevOrigins)}
 
-// ── CSRF origin validation for server actions ───────────────────────────
-// Matches Next.js behavior: compare the Origin header against the Host header.
-// If they don't match, the request is rejected with 403 unless the origin is
-// in the allowedOrigins list (from experimental.serverActions.allowedOrigins).
-function __isOriginAllowed(origin, allowed) {
-  for (const pattern of allowed) {
-    if (pattern.startsWith("*.")) {
-      // Wildcard: *.example.com matches sub.example.com, a.b.example.com
-      const suffix = pattern.slice(1); // ".example.com"
-      if (origin === pattern.slice(2) || origin.endsWith(suffix)) return true;
-    } else if (origin === pattern) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function __validateCsrfOrigin(request) {
-  const originHeader = request.headers.get("origin");
-  // If there's no Origin header, allow the request — same-origin requests
-  // from non-fetch navigations (e.g. SSR) may lack an Origin header.
-  // The x-rsc-action custom header already provides protection against simple
-  // form-based CSRF since custom headers can't be set by cross-origin forms.
-  if (!originHeader || originHeader === "null") return null;
-
-  let originHost;
-  try {
-    originHost = new URL(originHeader).host.toLowerCase();
-  } catch {
-    return new Response("Forbidden", { status: 403, headers: { "Content-Type": "text/plain" } });
-  }
-
-  // Only use the Host header for origin comparison — never trust
-  // X-Forwarded-Host here, since it can be freely set by the client
-  // and would allow the check to be bypassed if it matched a spoofed
-  // Origin. The prod server's resolveHost() handles trusted proxy
-  // scenarios separately.
-  const hostHeader = (
-    request.headers.get("host") ||
-    ""
-  ).split(",")[0].trim().toLowerCase();
-
-  if (!hostHeader) return null;
-
-  // Same origin — allow
-  if (originHost === hostHeader) return null;
-
-  // Check allowedOrigins from next.config.js
-  if (__allowedOrigins.length > 0 && __isOriginAllowed(originHost, __allowedOrigins)) return null;
-
-  console.warn(
-    \`[vinext] CSRF origin mismatch: origin "\${originHost}" does not match host "\${hostHeader}". Blocking server action request.\`
-  );
-  return new Response("Forbidden", { status: 403, headers: { "Content-Type": "text/plain" } });
-}
-
-// ── ReDoS-safe regex compilation ────────────────────────────────────────
+// ── ReDoS-safe regex compilation (still needed for middleware matching) ──
 ${generateSafeRegExpCode("modern")}
 
 // ── Path normalization ──────────────────────────────────────────────────
 ${generateNormalizePathCode("modern")}
+${generateRouteMatchNormalizationCode("modern")}
 
-// ── Config pattern matching (redirects, rewrites, headers) ──────────────
-function __matchConfigPattern(pathname, pattern) {
-  if (pattern.includes("(") || pattern.includes("\\\\") || /:[\\w-]+[*+][^/]/.test(pattern) || /:[\\w-]+\\./.test(pattern)) {
-    try {
-      const paramNames = [];
-      const regexStr = pattern
-        .replace(/\\./g, "\\\\.")
-        .replace(/:([\\w-]+)\\*(?:\\(([^)]+)\\))?/g, (_, name, c) => { paramNames.push(name); return c ? "(" + c + ")" : "(.*)"; })
-        .replace(/:([\\w-]+)\\+(?:\\(([^)]+)\\))?/g, (_, name, c) => { paramNames.push(name); return c ? "(" + c + ")" : "(.+)"; })
-        .replace(/:([\\w-]+)\\(([^)]+)\\)/g, (_, name, c) => { paramNames.push(name); return "(" + c + ")"; })
-        .replace(/:([\\w-]+)/g, (_, name) => { paramNames.push(name); return "([^/]+)"; });
-      const re = __safeRegExp("^" + regexStr + "$");
-      if (!re) return null;
-      const match = re.exec(pathname);
-      if (!match) return null;
-      const params = Object.create(null);
-      for (let i = 0; i < paramNames.length; i++) params[paramNames[i]] = match[i + 1] || "";
-      return params;
-    } catch { /* fall through */ }
-  }
-  const catchAllMatch = pattern.match(/:([\\w-]+)(\\*|\\+)$/);
-  if (catchAllMatch) {
-    const prefix = pattern.slice(0, pattern.lastIndexOf(":"));
-    const paramName = catchAllMatch[1];
-    const isPlus = catchAllMatch[2] === "+";
-    if (!pathname.startsWith(prefix.replace(/\\/$/, ""))) return null;
-    const rest = pathname.slice(prefix.replace(/\\/$/, "").length);
-    if (isPlus && (!rest || rest === "/")) return null;
-    let restValue = rest.startsWith("/") ? rest.slice(1) : rest;
-     // NOTE: Do NOT decodeURIComponent here. The pathname is already decoded at
-     // the request entry point. Decoding again would produce incorrect param values.
-    return { [paramName]: restValue };
-  }
-  const parts = pattern.split("/");
-  const pathParts = pathname.split("/");
-  if (parts.length !== pathParts.length) return null;
-  const params = Object.create(null);
-  for (let i = 0; i < parts.length; i++) {
-    if (parts[i].startsWith(":")) params[parts[i].slice(1)] = pathParts[i];
-    else if (parts[i] !== pathParts[i]) return null;
-  }
-  return params;
-}
-
-function __parseCookies(cookieHeader) {
-  if (!cookieHeader) return {};
-  const cookies = {};
-  for (const part of cookieHeader.split(";")) {
-    const eq = part.indexOf("=");
-    if (eq === -1) continue;
-    const key = part.slice(0, eq).trim();
-    const value = part.slice(eq + 1).trim();
-    if (key) cookies[key] = value;
-  }
-  return cookies;
-}
-
-function __checkSingleCondition(condition, ctx) {
-  switch (condition.type) {
-    case "header": {
-      const v = ctx.headers.get(condition.key);
-      if (v === null) return false;
-      if (condition.value !== undefined) { const re = __safeRegExp(condition.value); return re ? re.test(v) : v === condition.value; }
-      return true;
-    }
-    case "cookie": {
-      const v = ctx.cookies[condition.key];
-      if (v === undefined) return false;
-      if (condition.value !== undefined) { const re = __safeRegExp(condition.value); return re ? re.test(v) : v === condition.value; }
-      return true;
-    }
-    case "query": {
-      const v = ctx.query.get(condition.key);
-      if (v === null) return false;
-      if (condition.value !== undefined) { const re = __safeRegExp(condition.value); return re ? re.test(v) : v === condition.value; }
-      return true;
-    }
-    case "host": {
-      if (condition.value !== undefined) { const re = __safeRegExp(condition.value); return re ? re.test(ctx.host) : ctx.host === condition.value; }
-      return ctx.host === condition.key;
-    }
-    default: return false;
-  }
-}
-
-function __checkHasConditions(has, missing, ctx) {
-  if (has) { for (const c of has) { if (!__checkSingleCondition(c, ctx)) return false; } }
-  if (missing) { for (const c of missing) { if (__checkSingleCondition(c, ctx)) return false; } }
-  return true;
-}
-
-function __buildRequestContext(request) {
-  const url = new URL(request.url);
-  return {
-    headers: request.headers,
-    cookies: __parseCookies(request.headers.get("cookie")),
-    query: url.searchParams,
-    host: request.headers.get("host") || url.host,
-  };
-}
+// ── Config pattern matching, redirects, rewrites, headers, CSRF validation,
+//    external URL proxy, cookie parsing, and request context are imported from
+//    config-matchers.ts and request-pipeline.ts (see import statements above).
+//    This eliminates ~250 lines of duplicated inline code and ensures the
+//    single-pass tokenizer in config-matchers.ts is used consistently
+//    (fixing the chained .replace() divergence flagged by CodeQL).
 
 /**
  * Build a request context from the live ALS HeadersContext, which reflects
@@ -1111,7 +1310,7 @@ function __buildRequestContext(request) {
 function __buildPostMwRequestContext(request) {
   const url = new URL(request.url);
   const ctx = getHeadersContext();
-  if (!ctx) return __buildRequestContext(request);
+  if (!ctx) return requestContextFromRequest(request);
   // ctx.cookies is a Map<string, string> (HeadersContext), but RequestContext
   // requires a plain Record<string, string> for has/missing cookie evaluation
   // (config-matchers.ts uses obj[key] not Map.get()). Convert here.
@@ -1120,55 +1319,18 @@ function __buildPostMwRequestContext(request) {
     headers: ctx.headers,
     cookies: cookiesRecord,
     query: url.searchParams,
-    host: ctx.headers.get("host") || url.host,
+    host: normalizeHost(ctx.headers.get("host"), url.hostname),
   };
 }
 
-function __sanitizeDestination(dest) {
-  if (dest.startsWith("http://") || dest.startsWith("https://")) return dest;
-  dest = dest.replace(/^[\\\\/]+/, "/");
-  return dest;
-}
-
-function __applyConfigRedirects(pathname, ctx) {
-  for (const rule of __configRedirects) {
-    const params = __matchConfigPattern(pathname, rule.source);
-    if (params) {
-      if (ctx && (rule.has || rule.missing)) { if (!__checkHasConditions(rule.has, rule.missing, ctx)) continue; }
-      let dest = rule.destination;
-      for (const [key, value] of Object.entries(params)) { dest = dest.replace(":" + key + "*", value); dest = dest.replace(":" + key + "+", value); dest = dest.replace(":" + key, value); }
-      dest = __sanitizeDestination(dest);
-      return { destination: dest, permanent: rule.permanent };
-    }
-  }
-  return null;
-}
-
-function __applyConfigRewrites(pathname, rules, ctx) {
-  for (const rule of rules) {
-    const params = __matchConfigPattern(pathname, rule.source);
-    if (params) {
-      if (ctx && (rule.has || rule.missing)) { if (!__checkHasConditions(rule.has, rule.missing, ctx)) continue; }
-      let dest = rule.destination;
-      for (const [key, value] of Object.entries(params)) { dest = dest.replace(":" + key + "*", value); dest = dest.replace(":" + key + "+", value); dest = dest.replace(":" + key, value); }
-      dest = __sanitizeDestination(dest);
-      return dest;
-    }
-  }
-  return null;
-}
-
-function __isExternalUrl(url) {
-  return /^[a-z][a-z0-9+.-]*:/i.test(url) || url.startsWith("//");
-}
-
 /**
- * Maximum server-action request body size (1 MB).
- * Matches the Next.js default for serverActions.bodySizeLimit.
+ * Maximum server-action request body size.
+ * Configurable via experimental.serverActions.bodySizeLimit in next.config.
+ * Defaults to 1MB, matching the Next.js default.
  * @see https://nextjs.org/docs/app/api-reference/config/next-config-js/serverActions#bodysizelimit
  * Prevents unbounded request body buffering.
  */
-var __MAX_ACTION_BODY_SIZE = 1 * 1024 * 1024;
+var __MAX_ACTION_BODY_SIZE = ${JSON.stringify(bodySizeLimit)};
 
 /**
  * Read a request body as text with a size limit.
@@ -1227,83 +1389,31 @@ async function __readFormDataWithLimit(request, maxBytes) {
   return new Response(combined, { headers: { "Content-Type": contentType } }).formData();
 }
 
-const __hopByHopHeaders = new Set(["connection","keep-alive","proxy-authenticate","proxy-authorization","te","trailers","transfer-encoding","upgrade"]);
-
-async function __proxyExternalRequest(request, externalUrl) {
-  const originalUrl = new URL(request.url);
-  const targetUrl = new URL(externalUrl);
-  for (const [key, value] of originalUrl.searchParams) {
-    if (!targetUrl.searchParams.has(key)) targetUrl.searchParams.set(key, value);
+export default async function handler(request, ctx) {
+  ${
+    instrumentationPath
+      ? `// Ensure instrumentation.register() has run before handling the first request.
+  // This is a no-op after the first call (guarded by __instrumentationInitialized).
+  await __ensureInstrumentation();
+  `
+      : ""
   }
-  const headers = new Headers(request.headers);
-  headers.set("host", targetUrl.host);
-  headers.delete("connection");
-  for (const key of [...headers.keys()]) {
-    if (key.startsWith("x-middleware-")) headers.delete(key);
-  }
-  const method = request.method;
-  const hasBody = method !== "GET" && method !== "HEAD";
-  const init = { method, headers, redirect: "manual", signal: AbortSignal.timeout(30000) };
-  if (hasBody && request.body) { init.body = request.body; init.duplex = "half"; }
-  let upstream;
-  try { upstream = await fetch(targetUrl.href, init); }
-  catch (e) {
-    if (e && e.name === "TimeoutError") return new Response("Gateway Timeout", { status: 504 });
-    console.error("[vinext] External rewrite proxy error:", e); return new Response("Bad Gateway", { status: 502 });
-  }
-  const respHeaders = new Headers();
-  // Node.js fetch() auto-decompresses response bodies, while Workers fetch()
-  // preserves wire encoding. Only strip encoding/length on Node.js to avoid
-  // double-decompression errors without breaking Workers parity.
-  const __isNodeRuntime = typeof process !== "undefined" && !!(process.versions && process.versions.node);
-  upstream.headers.forEach(function(value, key) {
-    var lower = key.toLowerCase();
-    if (__hopByHopHeaders.has(lower)) return;
-    if (__isNodeRuntime && (lower === "content-encoding" || lower === "content-length")) return;
-    respHeaders.append(key, value);
-  });
-  return new Response(upstream.body, { status: upstream.status, statusText: upstream.statusText, headers: respHeaders });
-}
-
-function __applyConfigHeaders(pathname, ctx) {
-  const result = [];
-  for (const rule of __configHeaders) {
-    const groups = [];
-    const withPlaceholders = rule.source.replace(/\\(([^)]+)\\)/g, (_, inner) => {
-      groups.push(inner);
-      return "___GROUP_" + (groups.length - 1) + "___";
-    });
-    const escaped = withPlaceholders
-      .replace(/\\./g, "\\\\.")
-      .replace(/\\+/g, "\\\\+")
-      .replace(/\\?/g, "\\\\?")
-      .replace(/\\*/g, ".*")
-      .replace(/:[\\w-]+/g, "[^/]+")
-      .replace(/___GROUP_(\\d+)___/g, (_, idx) => "(" + groups[Number(idx)] + ")");
-    const sourceRegex = __safeRegExp("^" + escaped + "$");
-    if (sourceRegex && sourceRegex.test(pathname)) {
-      if (ctx && (rule.has || rule.missing)) {
-        if (!__checkHasConditions(rule.has, rule.missing, ctx)) continue;
-      }
-      result.push(...rule.headers);
-    }
-  }
-  return result;
-}
-
-export default async function handler(request) {
   // Wrap the entire request in nested AsyncLocalStorage.run() scopes to ensure
   // per-request isolation for all state modules. Each runWith*() creates an
   // ALS scope that propagates through all async continuations (including RSC
   // streaming), preventing state leakage between concurrent requests on
   // Cloudflare Workers and other concurrent runtimes.
+  //
+  // runWithExecutionContext stores the Workers ExecutionContext (ctx) in ALS so
+  // that KVCacheHandler._putInBackground can register background KV puts with
+  // ctx.waitUntil() without needing ctx passed at construction time.
   const headersCtx = headersContextFromRequest(request);
-  return runWithHeadersContext(headersCtx, () =>
+  const _run = () => runWithHeadersContext(headersCtx, () =>
     _runWithNavigationContext(() =>
       _runWithCacheState(() =>
         _runWithPrivateCache(() =>
           runWithFetchCache(async () => {
-            const __reqCtx = __buildRequestContext(request);
+            const __reqCtx = requestContextFromRequest(request);
             // Per-request container for middleware state. Passed into
             // _handleRequest which fills in .headers and .status;
             // avoids module-level variables that race on Workers.
@@ -1316,9 +1426,9 @@ export default async function handler(request) {
               if (__configHeaders.length) {
                 const url = new URL(request.url);
                 let pathname;
-                try { pathname = __normalizePath(decodeURIComponent(url.pathname)); } catch { pathname = url.pathname; }
+                try { pathname = __normalizePath(__normalizePathnameForRouteMatch(url.pathname)); } catch { pathname = url.pathname; }
                 ${bp ? `if (pathname.startsWith(${JSON.stringify(bp)})) pathname = pathname.slice(${JSON.stringify(bp)}.length) || "/";` : ""}
-                const extraHeaders = __applyConfigHeaders(pathname, __reqCtx);
+                const extraHeaders = matchHeaders(pathname, __configHeaders, __reqCtx);
                 for (const h of extraHeaders) {
                   // Use append() for headers where multiple values must coexist
                   // (Vary, Set-Cookie). Using set() on these would destroy
@@ -1341,6 +1451,7 @@ export default async function handler(request) {
       )
     )
   );
+  return ctx ? _runWithExecutionContext(ctx, _run) : _run();
 }
 
 async function _handleRequest(request, __reqCtx, _mwCtx) {
@@ -1352,47 +1463,39 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
   // Format: "handlerStart,compileMs,renderMs" - all as integers (ms). Dev-only.
   const url = new URL(request.url);
 
-  // ── Cross-origin request protection ─────────────────────────────────
+  // ── Cross-origin request protection (dev only) ─────────────────────
   // Block requests from non-localhost origins to prevent data exfiltration.
-  const __originBlock = __validateDevRequestOrigin(request);
-  if (__originBlock) return __originBlock;
-
-  // Guard against protocol-relative URL open redirects.
-  // Paths like //example.com/ would be redirected to //example.com by the
-  // trailing-slash normalizer, which browsers interpret as http://example.com.
-  // Backslashes are equivalent to forward slashes in the URL spec
-  // (e.g. /\\evil.com is treated as //evil.com by browsers and the URL constructor).
-  // Next.js returns 404 for these paths. Check the RAW pathname before
-  // normalization so the guard fires before normalizePath collapses //.
-  if (url.pathname.replaceAll("\\\\", "/").startsWith("//")) {
-    return new Response("404 Not Found", { status: 404 });
+  // Skipped in production — Vite replaces NODE_ENV at build time.
+  if (process.env.NODE_ENV !== "production") {
+    const __originBlock = __validateDevRequestOrigin(request);
+    if (__originBlock) return __originBlock;
   }
 
-  // Decode percent-encoding and normalize pathname to canonical form.
-  // decodeURIComponent prevents /%61dmin from bypassing /admin matchers.
+  // Guard against protocol-relative URL open redirects (see request-pipeline.ts).
+  const __protoGuard = guardProtocolRelativeUrl(url.pathname);
+  if (__protoGuard) return __protoGuard;
+
+  // Decode percent-encoding segment-wise and normalize pathname to canonical form.
+  // This preserves encoded path delimiters like %2F within a single segment.
   // __normalizePath collapses //foo///bar → /foo/bar, resolves . and .. segments.
   let decodedUrlPathname;
-  try { decodedUrlPathname = decodeURIComponent(url.pathname); } catch (e) {
+  try { decodedUrlPathname = __normalizePathnameForRouteMatchStrict(url.pathname); } catch (e) {
     return new Response("Bad Request", { status: 400 });
   }
   let pathname = __normalizePath(decodedUrlPathname);
 
-  ${bp ? `
+  ${
+    bp
+      ? `
   // Strip basePath prefix
-  if (__basePath && pathname.startsWith(__basePath)) {
-    pathname = pathname.slice(__basePath.length) || "/";
+  pathname = stripBasePath(pathname, __basePath);
+  `
+      : ""
   }
-  ` : ""}
 
   // Trailing slash normalization (redirect to canonical form)
-  if (pathname !== "/" && !pathname.startsWith("/api")) {
-    const hasTrailing = pathname.endsWith("/");
-    if (__trailingSlash && !hasTrailing && !pathname.endsWith(".rsc")) {
-      return Response.redirect(new URL(__basePath + pathname + "/" + url.search, request.url), 308);
-    } else if (!__trailingSlash && hasTrailing) {
-      return Response.redirect(new URL(__basePath + pathname.replace(/\\/+$/, "") + url.search, request.url), 308);
-    }
-  }
+  const __tsRedirect = normalizeTrailingSlash(pathname, __basePath, __trailingSlash, url.search);
+  if (__tsRedirect) return __tsRedirect;
 
   // ── Apply redirects from next.config.js ───────────────────────────────
   if (__configRedirects.length) {
@@ -1400,10 +1503,12 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
     // arrive as /some/path.rsc but redirect patterns are defined without it (e.g.
     // /some/path). Without this, soft-nav fetches bypass all config redirects.
     const __redirPathname = pathname.endsWith(".rsc") ? pathname.slice(0, -4) : pathname;
-    const __redir = __applyConfigRedirects(__redirPathname, __reqCtx);
+    const __redir = matchRedirect(__redirPathname, __configRedirects, __reqCtx);
     if (__redir) {
-      const __redirDest = __sanitizeDestination(
-        __basePath && !__redir.destination.startsWith(__basePath)
+      const __redirDest = sanitizeDestination(
+        __basePath &&
+          !isExternalUrl(__redir.destination) &&
+          !hasBasePath(__redir.destination, __basePath)
           ? __basePath + __redir.destination
           : __redir.destination
       );
@@ -1421,7 +1526,9 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
   // _mwCtx (per-request container) so handler() can merge them into
   // every response path without module-level state that races on Workers.
 
-  ${middlewarePath ? `
+  ${
+    middlewarePath
+      ? `
    // Run proxy/middleware if present and path matches.
    // Validate exports match the file type (proxy.ts vs middleware.ts), matching Next.js behavior.
    // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/proxy-missing-export/proxy-missing-export.test.ts
@@ -1435,7 +1542,7 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
     throw new Error("The " + _fileType + " file must export a function named \`" + _expectedExport + "\` or a \`default\` function.");
   }
   const middlewareMatcher = middlewareModule.config?.matcher;
-  if (matchesMiddleware(cleanPathname, middlewareMatcher)) {
+  if (matchesMiddleware(cleanPathname, middlewareMatcher, request, __i18nConfig)) {
     try {
       // Wrap in NextRequest so middleware gets .nextUrl, .cookies, .geo, .ip, etc.
        // Always construct a new Request with the fully decoded + normalized pathname
@@ -1444,7 +1551,9 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
       mwUrl.pathname = cleanPathname;
       const mwRequest = new Request(mwUrl, request);
       const nextRequest = mwRequest instanceof NextRequest ? mwRequest : new NextRequest(mwRequest);
-      const mwResponse = await middlewareFn(nextRequest);
+      const mwFetchEvent = new NextFetchEvent({ page: cleanPathname });
+      const mwResponse = await middlewareFn(nextRequest, mwFetchEvent);
+      mwFetchEvent.drainWaitUntil();
       if (mwResponse) {
         // Check for x-middleware-next (continue)
         if (mwResponse.headers.get("x-middleware-next") === "1") {
@@ -1499,30 +1608,28 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
   // internal routing signals and must never reach clients.
   if (_mwCtx.headers) {
     applyMiddlewareRequestHeaders(_mwCtx.headers);
-    for (const key of [..._mwCtx.headers.keys()]) {
-      if (key.startsWith("x-middleware-")) {
-        _mwCtx.headers.delete(key);
-      }
-    }
+    processMiddlewareHeaders(_mwCtx.headers);
   }
-  ` : ""}
+  `
+      : ""
+  }
 
   // Build post-middleware request context for afterFiles/fallback rewrites.
   // These run after middleware in the App Router execution order and should
   // evaluate has/missing conditions against middleware-modified headers.
-  // When no middleware is present, this falls back to __buildRequestContext.
+  // When no middleware is present, this falls back to requestContextFromRequest.
   const __postMwReqCtx = __buildPostMwRequestContext(request);
 
   // ── Apply beforeFiles rewrites from next.config.js ────────────────────
   // In App Router execution order, beforeFiles runs after middleware so that
   // has/missing conditions can evaluate against middleware-modified headers.
   if (__configRewrites.beforeFiles && __configRewrites.beforeFiles.length) {
-    const __rewritten = __applyConfigRewrites(cleanPathname, __configRewrites.beforeFiles, __postMwReqCtx);
+    const __rewritten = matchRewrite(cleanPathname, __configRewrites.beforeFiles, __postMwReqCtx);
     if (__rewritten) {
-      if (__isExternalUrl(__rewritten)) {
+      if (isExternalUrl(__rewritten)) {
         setHeadersContext(null);
         setNavigationContext(null);
-        return __proxyExternalRequest(request, __rewritten);
+        return proxyExternalRequest(request, __rewritten);
       }
       cleanPathname = __rewritten;
     }
@@ -1530,26 +1637,42 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
 
   // ── Image optimization passthrough (dev mode — no transformation) ───────
   if (cleanPathname === "/_vinext/image") {
-    const __rawImgUrl = url.searchParams.get("url");
-    // Normalize backslashes: browsers and the URL constructor treat
-    // /\\evil.com as protocol-relative (//evil.com), bypassing the // check.
-    const __imgUrl = __rawImgUrl?.replaceAll("\\\\", "/") ?? null;
-    // Allowlist: must start with "/" but not "//" — blocks absolute URLs,
-    // protocol-relative, backslash variants, and exotic schemes.
-    if (!__imgUrl || !__imgUrl.startsWith("/") || __imgUrl.startsWith("//")) {
-      return new Response(!__rawImgUrl ? "Missing url parameter" : "Only relative URLs allowed", { status: 400 });
-    }
-    // Validate the constructed URL's origin hasn't changed (defense in depth).
-    const __resolvedImg = new URL(__imgUrl, request.url);
-    if (__resolvedImg.origin !== url.origin) {
-      return new Response("Only relative URLs allowed", { status: 400 });
-    }
+    const __imgResult = validateImageUrl(url.searchParams.get("url"), request.url);
+    if (__imgResult instanceof Response) return __imgResult;
     // In dev, redirect to the original asset URL so Vite's static serving handles it.
-    return Response.redirect(__resolvedImg.href, 302);
+    return Response.redirect(new URL(__imgResult, url.origin).href, 302);
   }
 
   // Handle metadata routes (sitemap.xml, robots.txt, manifest.webmanifest, etc.)
   for (const metaRoute of metadataRoutes) {
+    // generateSitemaps() support — paginated sitemaps at /{prefix}/sitemap/{id}.xml
+    // When a sitemap module exports generateSitemaps, the base URL (e.g. /products/sitemap.xml)
+    // is no longer served. Instead, individual sitemaps are served at /products/sitemap/{id}.xml.
+    if (
+      metaRoute.type === "sitemap" &&
+      metaRoute.isDynamic &&
+      typeof metaRoute.module.generateSitemaps === "function"
+    ) {
+      const sitemapPrefix = metaRoute.servedUrl.slice(0, -4); // strip ".xml"
+      // Match exactly /{prefix}/{id}.xml — one segment only (no slashes in id)
+      if (cleanPathname.startsWith(sitemapPrefix + "/") && cleanPathname.endsWith(".xml")) {
+        const rawId = cleanPathname.slice(sitemapPrefix.length + 1, -4);
+        if (rawId.includes("/")) continue; // multi-segment — not a paginated sitemap
+        const sitemaps = await metaRoute.module.generateSitemaps();
+        const matched = sitemaps.find(function(s) { return String(s.id) === rawId; });
+        if (!matched) return new Response("Not Found", { status: 404 });
+        // Pass the original typed id from generateSitemaps() so numeric IDs stay numeric.
+        // TODO: wrap with makeThenableParams-style Promise when upgrading to Next.js 16
+        // full-Promise param semantics (id becomes Promise<string> in v16).
+        const result = await metaRoute.module.default({ id: matched.id });
+        if (result instanceof Response) return result;
+        return new Response(sitemapToXml(result), {
+          headers: { "Content-Type": metaRoute.contentType },
+        });
+      }
+      // Skip — the base servedUrl is not served when generateSitemaps exists
+      continue;
+    }
     if (cleanPathname === metaRoute.servedUrl) {
       if (metaRoute.isDynamic) {
         // Dynamic metadata route — call the default export and serialize
@@ -1601,7 +1724,7 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
     // ── CSRF protection ─────────────────────────────────────────────────
     // Verify that the Origin header matches the Host header to prevent
     // cross-site request forgery, matching Next.js server action behavior.
-    const csrfResponse = __validateCsrfOrigin(request);
+    const csrfResponse = validateCsrfOrigin(request, __allowedOrigins);
     if (csrfResponse) return csrfResponse;
 
     // ── Body size limit ─────────────────────────────────────────────────
@@ -1635,39 +1758,44 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
       const action = await loadServerAction(actionId);
       let returnValue;
       let actionRedirect = null;
+      const previousHeadersPhase = setHeadersAccessPhase("action");
       try {
-        const data = await action.apply(null, args);
-        returnValue = { ok: true, data };
-      } catch (e) {
-        // Detect redirect() / permanentRedirect() called inside the action.
-        // These throw errors with digest "NEXT_REDIRECT;replace;url[;status]".
-        // The URL is encodeURIComponent-encoded to prevent semicolons in the URL
-        // from corrupting the delimiter-based digest format.
-        if (e && typeof e === "object" && "digest" in e) {
-          const digest = String(e.digest);
-          if (digest.startsWith("NEXT_REDIRECT;")) {
-            const parts = digest.split(";");
-            actionRedirect = {
-              url: decodeURIComponent(parts[2]),
-              type: parts[1] || "replace",       // "push" or "replace"
-              status: parts[3] ? parseInt(parts[3], 10) : 307,
-            };
-            returnValue = { ok: true, data: undefined };
-          } else if (digest === "NEXT_NOT_FOUND" || digest.startsWith("NEXT_HTTP_ERROR_FALLBACK;")) {
-            // notFound() / forbidden() / unauthorized() in action — package as error
-            returnValue = { ok: false, data: e };
+        try {
+          const data = await action.apply(null, args);
+          returnValue = { ok: true, data };
+        } catch (e) {
+          // Detect redirect() / permanentRedirect() called inside the action.
+          // These throw errors with digest "NEXT_REDIRECT;replace;url[;status]".
+          // The URL is encodeURIComponent-encoded to prevent semicolons in the URL
+          // from corrupting the delimiter-based digest format.
+          if (e && typeof e === "object" && "digest" in e) {
+            const digest = String(e.digest);
+            if (digest.startsWith("NEXT_REDIRECT;")) {
+              const parts = digest.split(";");
+              actionRedirect = {
+                url: decodeURIComponent(parts[2]),
+                type: parts[1] || "replace",       // "push" or "replace"
+                status: parts[3] ? parseInt(parts[3], 10) : 307,
+              };
+              returnValue = { ok: true, data: undefined };
+            } else if (digest === "NEXT_NOT_FOUND" || digest.startsWith("NEXT_HTTP_ERROR_FALLBACK;")) {
+              // notFound() / forbidden() / unauthorized() in action — package as error
+              returnValue = { ok: false, data: e };
+            } else {
+              // Non-navigation digest error — sanitize in production to avoid
+              // leaking internal details (connection strings, paths, etc.)
+              console.error("[vinext] Server action error:", e);
+              returnValue = { ok: false, data: __sanitizeErrorForClient(e) };
+            }
           } else {
-            // Non-navigation digest error — sanitize in production to avoid
-            // leaking internal details (connection strings, paths, etc.)
+            // Unhandled error — sanitize in production to avoid leaking
+            // internal details (database errors, file paths, stack traces, etc.)
             console.error("[vinext] Server action error:", e);
             returnValue = { ok: false, data: __sanitizeErrorForClient(e) };
           }
-        } else {
-          // Unhandled error — sanitize in production to avoid leaking
-          // internal details (database errors, file paths, stack traces, etc.)
-          console.error("[vinext] Server action error:", e);
-          returnValue = { ok: false, data: __sanitizeErrorForClient(e) };
         }
+      } finally {
+        setHeadersAccessPhase(previousHeadersPhase);
       }
 
       // If the action called redirect(), signal the client to navigate.
@@ -1696,7 +1824,7 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
 
       // After the action, re-render the current page so the client
       // gets an updated React tree reflecting any mutations.
-      const match = matchRoute(cleanPathname, routes);
+      const match = matchRoute(cleanPathname);
       let element;
       if (match) {
         const { route: actionRoute, params: actionParams } = match;
@@ -1710,16 +1838,23 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
         element = createElement("div", null, "Page not found");
       }
 
+      const onRenderError = createRscOnErrorHandler(
+        request,
+        cleanPathname,
+        match ? match.route.pattern : cleanPathname,
+      );
       const rscStream = renderToReadableStream(
         { root: element, returnValue },
-        { temporaryReferences, onError: rscOnError },
+        { temporaryReferences, onError: onRenderError },
       );
 
-      // Collect cookies set during the action
+      // Collect cookies set during the action synchronously (before stream is consumed).
+      // Do NOT clear headers/navigation context here — the RSC stream is consumed lazily
+      // by the client, and async server components that run during consumption need the
+      // context to still be live. The AsyncLocalStorage scope from runWithHeadersContext
+      // handles cleanup naturally when all async continuations complete.
       const actionPendingCookies = getAndClearPendingCookies();
       const actionDraftCookie = getDraftModeCookieHeader();
-      setHeadersContext(null);
-      setNavigationContext(null);
 
       const actionHeaders = { "Content-Type": "text/x-component; charset=utf-8", "Vary": "RSC, Accept" };
       const actionResponse = new Response(rscStream, { headers: actionHeaders });
@@ -1753,30 +1888,30 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
 
   // ── Apply afterFiles rewrites from next.config.js ──────────────────────
   if (__configRewrites.afterFiles && __configRewrites.afterFiles.length) {
-    const __afterRewritten = __applyConfigRewrites(cleanPathname, __configRewrites.afterFiles, __postMwReqCtx);
+    const __afterRewritten = matchRewrite(cleanPathname, __configRewrites.afterFiles, __postMwReqCtx);
     if (__afterRewritten) {
-      if (__isExternalUrl(__afterRewritten)) {
+      if (isExternalUrl(__afterRewritten)) {
         setHeadersContext(null);
         setNavigationContext(null);
-        return __proxyExternalRequest(request, __afterRewritten);
+        return proxyExternalRequest(request, __afterRewritten);
       }
       cleanPathname = __afterRewritten;
     }
   }
 
-  let match = matchRoute(cleanPathname, routes);
+  let match = matchRoute(cleanPathname);
 
   // ── Fallback rewrites from next.config.js (if no route matched) ───────
   if (!match && __configRewrites.fallback && __configRewrites.fallback.length) {
-    const __fallbackRewritten = __applyConfigRewrites(cleanPathname, __configRewrites.fallback, __postMwReqCtx);
+    const __fallbackRewritten = matchRewrite(cleanPathname, __configRewrites.fallback, __postMwReqCtx);
     if (__fallbackRewritten) {
-      if (__isExternalUrl(__fallbackRewritten)) {
+      if (isExternalUrl(__fallbackRewritten)) {
         setHeadersContext(null);
         setNavigationContext(null);
-        return __proxyExternalRequest(request, __fallbackRewritten);
+        return proxyExternalRequest(request, __fallbackRewritten);
       }
       cleanPathname = __fallbackRewritten;
-      match = matchRoute(cleanPathname, routes);
+      match = matchRoute(cleanPathname);
     }
   }
 
@@ -1813,16 +1948,39 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
     }
     const hasDefault = typeof handler["default"] === "function";
 
+    // Route handlers need the same middleware header/status merge behavior as
+    // page responses. This keeps middleware response headers visible on API
+    // routes in Workers/dev, and preserves custom rewrite status overrides.
+    function attachRouteHandlerMiddlewareContext(response) {
+      // _mwCtx.headers is only set (non-null) when middleware actually ran and
+      // produced a continue/rewrite response. An empty Headers object (middleware
+      // ran but produced no response headers) is a harmless edge case: the early
+      // return is skipped, but the copy loop below is a no-op, so no incorrect
+      // headers are added. The allocation cost in that case is acceptable.
+      if (!_mwCtx.headers && _mwCtx.status == null) return response;
+      const responseHeaders = new Headers(response.headers);
+      if (_mwCtx.headers) {
+        for (const [key, value] of _mwCtx.headers) {
+          responseHeaders.append(key, value);
+        }
+      }
+      return new Response(response.body, {
+        status: _mwCtx.status ?? response.status,
+        statusText: response.statusText,
+        headers: responseHeaders,
+      });
+    }
+
     // OPTIONS auto-implementation: respond with Allow header and 204
     if (method === "OPTIONS" && typeof handler["OPTIONS"] !== "function") {
       const allowMethods = hasDefault ? HTTP_METHODS : exportedMethods;
       if (!allowMethods.includes("OPTIONS")) allowMethods.push("OPTIONS");
       setHeadersContext(null);
       setNavigationContext(null);
-      return new Response(null, {
+      return attachRouteHandlerMiddlewareContext(new Response(null, {
         status: 204,
         headers: { "Allow": allowMethods.join(", ") },
-      });
+      }));
     }
 
     // HEAD auto-implementation: run GET handler and strip body
@@ -1834,12 +1992,20 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
     }
 
     if (typeof handlerFn === "function") {
+      const previousHeadersPhase = setHeadersAccessPhase("route-handler");
       try {
         const response = await handlerFn(request, { params });
+        const dynamicUsedInHandler = consumeDynamicUsage();
 
         // Apply Cache-Control from route segment config (export const revalidate = N).
-        // Next.js sets s-maxage on GET route handlers with a numeric revalidate value.
-        if (revalidateSeconds !== null && (method === "GET" || isAutoHead) && !response.headers.has("cache-control")) {
+        // Runtime request APIs like headers() / cookies() make GET handlers dynamic,
+        // so only attach ISR headers when the handler stayed static.
+        if (
+          revalidateSeconds !== null &&
+          !dynamicUsedInHandler &&
+          (method === "GET" || isAutoHead) &&
+          !response.headers.has("cache-control")
+        ) {
           response.headers.set("cache-control", "s-maxage=" + revalidateSeconds + ", stale-while-revalidate");
         }
 
@@ -1858,28 +2024,28 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
           if (draftCookie) newHeaders.append("Set-Cookie", draftCookie);
 
           if (isAutoHead) {
-            return new Response(null, {
+            return attachRouteHandlerMiddlewareContext(new Response(null, {
               status: response.status,
               statusText: response.statusText,
               headers: newHeaders,
-            });
+            }));
           }
-          return new Response(response.body, {
+          return attachRouteHandlerMiddlewareContext(new Response(response.body, {
             status: response.status,
             statusText: response.statusText,
             headers: newHeaders,
-          });
+          }));
         }
 
         if (isAutoHead) {
           // Strip body for auto-HEAD, preserve headers and status
-          return new Response(null, {
+          return attachRouteHandlerMiddlewareContext(new Response(null, {
             status: response.status,
             statusText: response.statusText,
             headers: response.headers,
-          });
+          }));
         }
-        return response;
+        return attachRouteHandlerMiddlewareContext(response);
       } catch (err) {
         getAndClearPendingCookies(); // Clear any pending cookies on error
         // Catch redirect() / notFound() thrown from route handlers
@@ -1891,16 +2057,16 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
             const statusCode = parts[3] ? parseInt(parts[3], 10) : 307;
             setHeadersContext(null);
             setNavigationContext(null);
-            return new Response(null, {
+            return attachRouteHandlerMiddlewareContext(new Response(null, {
               status: statusCode,
               headers: { Location: new URL(redirectUrl, request.url).toString() },
-            });
+            }));
           }
           if (digest === "NEXT_NOT_FOUND" || digest.startsWith("NEXT_HTTP_ERROR_FALLBACK;")) {
             const statusCode = digest === "NEXT_NOT_FOUND" ? 404 : parseInt(digest.split(";")[1], 10);
             setHeadersContext(null);
             setNavigationContext(null);
-            return new Response(null, { status: statusCode });
+            return attachRouteHandlerMiddlewareContext(new Response(null, { status: statusCode }));
           }
         }
         setHeadersContext(null);
@@ -1913,15 +2079,17 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
         ).catch((reportErr) => {
           console.error("[vinext] Failed to report route handler error:", reportErr);
         });
-        return new Response(null, { status: 500 });
+        return attachRouteHandlerMiddlewareContext(new Response(null, { status: 500 }));
+      } finally {
+        setHeadersAccessPhase(previousHeadersPhase);
       }
     }
     setHeadersContext(null);
     setNavigationContext(null);
-    return new Response(null, {
+    return attachRouteHandlerMiddlewareContext(new Response(null, {
       status: 405,
       headers: { Allow: exportedMethods.join(", ") },
-    });
+    }));
   }
 
   // Build the component tree: layouts wrapping the page
@@ -1950,25 +2118,18 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
     });
   }
 
-  // dynamic = 'error': set a trap context that throws when headers/cookies are accessed
+  // dynamic = 'error': install an access error so request APIs fail with the
+  // static-generation message even for legacy sync property access.
   if (isDynamicError) {
     const errorMsg = 'Page with \`dynamic = "error"\` used a dynamic API. ' +
       'This page was expected to be fully static, but headers(), cookies(), ' +
       'or searchParams was accessed. Remove the dynamic API usage or change ' +
       'the dynamic config to "auto" or "force-dynamic".';
-    const throwingHeaders = new Proxy(new Headers(), {
-      get(target, prop) {
-        if (typeof prop === "string" && prop !== "then") throw new Error(errorMsg);
-        return Reflect.get(target, prop);
-      },
+    setHeadersContext({
+      headers: new Headers(),
+      cookies: new Map(),
+      accessError: new Error(errorMsg),
     });
-    const throwingCookies = new Proxy(new Map(), {
-      get(target, prop) {
-        if (typeof prop === "string" && prop !== "then") throw new Error(errorMsg);
-        return Reflect.get(target, prop);
-      },
-    });
-    setHeadersContext({ headers: throwingHeaders, cookies: throwingCookies });
     setNavigationContext({
       pathname: cleanPathname,
       searchParams: new URLSearchParams(),
@@ -1976,7 +2137,177 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
     });
   }
 
-  // dynamicParams = false: only params from generateStaticParams are allowed
+  // force-dynamic: set no-store Cache-Control
+  const isForceDynamic = dynamicConfig === "force-dynamic";
+
+  // ── ISR cache read (production only) ─────────────────────────────────────
+  // Read from cache BEFORE generateStaticParams and all rendering work.
+  // This is the critical performance optimization: on a cache hit we skip
+  // ALL expensive work (generateStaticParams, buildPageElement, layout probe,
+  // page probe, renderToReadableStream, SSR). Both HTML and RSC requests
+  // (client-side navigation / prefetch) are served from cache.
+  //
+  // HTML and RSC are stored under separate keys (matching Next.js's .html/.rsc
+  // file layout) so each request type reads and writes independently — no races,
+  // no partial-entry sentinels, no read-before-write hacks needed.
+  //
+  // force-static and dynamic='error' are compatible with ISR — they control
+  // how dynamic APIs behave during rendering, not whether results are cached.
+  // Only force-dynamic truly bypasses the ISR cache.
+  if (
+    process.env.NODE_ENV === "production" &&
+    !isForceDynamic &&
+    revalidateSeconds !== null && revalidateSeconds > 0 && revalidateSeconds !== Infinity
+  ) {
+    const __isrKey = isRscRequest ? __isrRscKey(cleanPathname) : __isrHtmlKey(cleanPathname);
+    try {
+      const __cached = await __isrGet(__isrKey);
+      if (__cached && !__cached.isStale && __cached.value.value && __cached.value.value.kind === "APP_PAGE") {
+        const __cachedValue = __cached.value.value;
+        const __hasRsc = !!__cachedValue.rscData;
+        const __hasHtml = typeof __cachedValue.html === "string" && __cachedValue.html.length > 0;
+        if (isRscRequest && __hasRsc) {
+          __isrDebug?.("HIT (RSC)", cleanPathname);
+          setHeadersContext(null);
+          setNavigationContext(null);
+          return new Response(__cachedValue.rscData, {
+            status: __cachedValue.status || 200,
+            headers: {
+              "Content-Type": "text/x-component; charset=utf-8",
+              "Cache-Control": "s-maxage=" + revalidateSeconds + ", stale-while-revalidate",
+              "Vary": "RSC, Accept",
+              "X-Vinext-Cache": "HIT",
+            },
+          });
+        }
+        if (!isRscRequest && __hasHtml) {
+          __isrDebug?.("HIT (HTML)", cleanPathname);
+          setHeadersContext(null);
+          setNavigationContext(null);
+          return new Response(__cachedValue.html, {
+            status: __cachedValue.status || 200,
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "s-maxage=" + revalidateSeconds + ", stale-while-revalidate",
+              "Vary": "RSC, Accept",
+              "X-Vinext-Cache": "HIT",
+            },
+          });
+        }
+        __isrDebug?.("MISS (empty cached entry)", cleanPathname);
+      }
+      if (__cached && __cached.isStale && __cached.value.value && __cached.value.value.kind === "APP_PAGE") {
+        // Stale cache hit — serve stale immediately, trigger background regeneration.
+        // Regen writes both keys independently so neither path blocks on the other.
+        const __staleValue = __cached.value.value;
+        const __staleStatus = __staleValue.status || 200;
+        const __revalSecs = revalidateSeconds;
+        __triggerBackgroundRegeneration(cleanPathname, async function() {
+          // Re-render the page to produce fresh HTML + RSC data for the cache
+          // Use an empty headers context for background regeneration — not the original
+          // user request — to prevent user-specific cookies/auth headers from leaking
+          // into content that is cached and served to all subsequent users.
+          const __revalHeadCtx = { headers: new Headers(), cookies: new Map() };
+          const __revalResult = await runWithHeadersContext(__revalHeadCtx, () =>
+            _runWithNavigationContext(() =>
+              _runWithCacheState(() =>
+                _runWithPrivateCache(() =>
+                  runWithFetchCache(async () => {
+                    setNavigationContext({ pathname: cleanPathname, searchParams: url.searchParams, params });
+                    const __revalElement = await buildPageElement(route, params, undefined, url.searchParams);
+                    const __revalOnError = createRscOnErrorHandler(request, cleanPathname, route.pattern);
+                    const __revalRscStream = renderToReadableStream(__revalElement, { onError: __revalOnError });
+                    // Tee RSC stream: one for SSR, one to capture rscData
+                    const [__revalRscForSsr, __revalRscForCapture] = __revalRscStream.tee();
+                    // Capture rscData bytes in parallel with SSR
+                    const __rscDataPromise = (async () => {
+                      const __rscReader = __revalRscForCapture.getReader();
+                      const __rscChunks = [];
+                      let __rscTotal = 0;
+                      for (;;) {
+                        const { done, value } = await __rscReader.read();
+                        if (done) break;
+                        __rscChunks.push(value);
+                        __rscTotal += value.byteLength;
+                      }
+                      const __rscBuf = new Uint8Array(__rscTotal);
+                      let __rscOff = 0;
+                      for (const c of __rscChunks) { __rscBuf.set(c, __rscOff); __rscOff += c.byteLength; }
+                      return __rscBuf.buffer;
+                    })();
+                    const __revalFontData = { links: _getSSRFontLinks(), styles: _getSSRFontStyles(), preloads: _getSSRFontPreloads() };
+                    const __revalSsrEntry = await import.meta.viteRsc.loadModule("ssr", "index");
+                    const __revalHtmlStream = await __revalSsrEntry.handleSsr(__revalRscForSsr, _getNavigationContext(), __revalFontData);
+                    setHeadersContext(null);
+                    setNavigationContext(null);
+                    // Collect the full HTML string from the stream
+                    const __revalReader = __revalHtmlStream.getReader();
+                    const __revalDecoder = new TextDecoder();
+                    const __revalChunks = [];
+                    for (;;) {
+                      const { done, value } = await __revalReader.read();
+                      if (done) break;
+                      __revalChunks.push(__revalDecoder.decode(value, { stream: true }));
+                    }
+                    __revalChunks.push(__revalDecoder.decode());
+                    const __freshHtml = __revalChunks.join("");
+                    const __freshRscData = await __rscDataPromise;
+                    const __pageTags = __pageCacheTags(cleanPathname, getCollectedFetchTags());
+                    return { html: __freshHtml, rscData: __freshRscData, tags: __pageTags };
+                  })
+                )
+              )
+            )
+          );
+          // Write HTML and RSC to their own keys independently — no races
+          await Promise.all([
+            __isrSet(__isrHtmlKey(cleanPathname), { kind: "APP_PAGE", html: __revalResult.html, rscData: undefined, headers: undefined, postponed: undefined, status: 200 }, __revalSecs, __revalResult.tags),
+            __isrSet(__isrRscKey(cleanPathname), { kind: "APP_PAGE", html: "", rscData: __revalResult.rscData, headers: undefined, postponed: undefined, status: 200 }, __revalSecs, __revalResult.tags),
+          ]);
+          __isrDebug?.("regen complete", cleanPathname);
+        });
+        if (isRscRequest && __staleValue.rscData) {
+          __isrDebug?.("STALE (RSC)", cleanPathname);
+          setHeadersContext(null);
+          setNavigationContext(null);
+          return new Response(__staleValue.rscData, {
+            status: __staleStatus,
+            headers: {
+              "Content-Type": "text/x-component; charset=utf-8",
+              "Cache-Control": "s-maxage=0, stale-while-revalidate",
+              "Vary": "RSC, Accept",
+              "X-Vinext-Cache": "STALE",
+            },
+          });
+        }
+        if (!isRscRequest && typeof __staleValue.html === "string" && __staleValue.html.length > 0) {
+          __isrDebug?.("STALE (HTML)", cleanPathname);
+          setHeadersContext(null);
+          setNavigationContext(null);
+          return new Response(__staleValue.html, {
+            status: __staleStatus,
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "s-maxage=0, stale-while-revalidate",
+              "Vary": "RSC, Accept",
+              "X-Vinext-Cache": "STALE",
+            },
+          });
+        }
+        // Stale entry exists but is empty for this request type — fall through to render
+        __isrDebug?.("STALE MISS (empty stale entry)", cleanPathname);
+      }
+      if (!__cached) {
+        __isrDebug?.("MISS (no cache entry)", cleanPathname);
+      }
+    } catch (__isrReadErr) {
+      // Cache read failure — fall through to normal rendering
+      console.error("[vinext] ISR cache read error:", __isrReadErr);
+    }
+  }
+
+  // dynamicParams = false: only params from generateStaticParams are allowed.
+  // This runs AFTER the ISR cache read so that a cache hit skips this work entirely.
   if (dynamicParamsConfig === false && route.isDynamic && typeof route.page?.generateStaticParams === "function") {
     try {
       // Pass parent params to generateStaticParams (Next.js top-down params passing).
@@ -2006,9 +2337,6 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
     }
   }
 
-  // force-dynamic: set no-store Cache-Control
-  const isForceDynamic = dynamicConfig === "force-dynamic";
-
   // Check for intercepting routes on RSC requests (client-side navigation).
   // If the target URL matches an intercepting route in a parallel slot,
   // render the source route with the intercepting page in the slot.
@@ -2019,7 +2347,7 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
       const sourceRoute = routes[intercept.sourceRouteIndex];
       if (sourceRoute && sourceRoute !== route) {
         // Render the source route (e.g. /feed) with the intercepting page in the slot
-        const sourceMatch = matchRoute(sourceRoute.pattern, routes);
+        const sourceMatch = matchRoute(sourceRoute.pattern);
         const sourceParams = sourceMatch ? sourceMatch.params : {};
         setNavigationContext({
           pathname: cleanPathname,
@@ -2031,9 +2359,16 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
           interceptPage: intercept.page,
           interceptParams: intercept.matchedParams,
         }, url.searchParams);
-        const interceptStream = renderToReadableStream(interceptElement, { onError: rscOnError });
-        setHeadersContext(null);
-        setNavigationContext(null);
+        const interceptOnError = createRscOnErrorHandler(
+          request,
+          cleanPathname,
+          sourceRoute.pattern,
+        );
+        const interceptStream = renderToReadableStream(interceptElement, { onError: interceptOnError });
+        // Do NOT clear headers/navigation context here — the RSC stream is consumed lazily
+        // by the client, and async server components that run during consumption need the
+        // context to still be live. The AsyncLocalStorage scope from runWithHeadersContext
+        // handles cleanup naturally when all async continuations complete.
         return new Response(interceptStream, {
           headers: { "Content-Type": "text/x-component; charset=utf-8", "Vary": "RSC, Accept" },
         });
@@ -2064,7 +2399,7 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
       }
       if (digest === "NEXT_NOT_FOUND" || digest.startsWith("NEXT_HTTP_ERROR_FALLBACK;")) {
         const statusCode = digest === "NEXT_NOT_FOUND" ? 404 : parseInt(digest.split(";")[1], 10);
-        const fallbackResp = await renderHTTPAccessFallbackPage(route, statusCode, isRscRequest, request);
+        const fallbackResp = await renderHTTPAccessFallbackPage(route, statusCode, isRscRequest, request, { matchedParams: params });
         if (fallbackResp) return fallbackResp;
         setHeadersContext(null);
         setNavigationContext(null);
@@ -2073,7 +2408,7 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
       }
     }
     // Non-special error (e.g. generateMetadata() threw) — render error.tsx if available
-    const errorBoundaryResp = await renderErrorBoundaryPage(route, buildErr, isRscRequest, request);
+    const errorBoundaryResp = await renderErrorBoundaryPage(route, buildErr, isRscRequest, request, params);
     if (errorBoundaryResp) return errorBoundaryResp;
     throw buildErr;
   }
@@ -2095,7 +2430,7 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
       }
       if (digest === "NEXT_NOT_FOUND" || digest.startsWith("NEXT_HTTP_ERROR_FALLBACK;")) {
         const statusCode = digest === "NEXT_NOT_FOUND" ? 404 : parseInt(digest.split(";")[1], 10);
-        const fallbackResp = await renderHTTPAccessFallbackPage(route, statusCode, isRscRequest, request);
+        const fallbackResp = await renderHTTPAccessFallbackPage(route, statusCode, isRscRequest, request, { matchedParams: params });
         if (fallbackResp) return fallbackResp;
         setHeadersContext(null);
         setNavigationContext(null);
@@ -2160,7 +2495,7 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
               const parentLayouts = route.layouts.slice(0, li);
               const fallbackResp = await renderHTTPAccessFallbackPage(
                 route, statusCode, isRscRequest, request,
-                { boundaryComponent: parentNotFound, layouts: parentLayouts }
+                { boundaryComponent: parentNotFound, layouts: parentLayouts, matchedParams: params }
               );
               if (fallbackResp) return fallbackResp;
               setHeadersContext(null);
@@ -2220,8 +2555,47 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
   // Mark end of compile phase: route matching, middleware, tree building are done.
   if (process.env.NODE_ENV !== "production") __compileEnd = performance.now();
 
-  // Render to RSC stream
-  const rscStream = renderToReadableStream(element, { onError: rscOnError });
+  // Render to RSC stream.
+  // Track non-navigation RSC errors so we can detect when the in-tree global
+  // ErrorBoundary catches during SSR (producing double <html>/<body>) and
+  // re-render with renderErrorBoundaryPage (which skips layouts for global-error).
+  let _rscErrorForRerender = null;
+  const _baseOnError = createRscOnErrorHandler(request, cleanPathname, route.pattern);
+  const onRenderError = function(error, requestInfo, errorContext) {
+    if (!(error && typeof error === "object" && "digest" in error)) {
+      _rscErrorForRerender = error;
+    }
+    return _baseOnError(error, requestInfo, errorContext);
+  };
+  const rscStream = renderToReadableStream(element, { onError: onRenderError });
+
+  // For ISR pages in production: tee the RSC stream immediately after creation so we
+  // can capture rscData for BOTH RSC requests (client-side nav/prefetch) and HTML
+  // requests. The tee must happen here — before the isRscRequest branch — so both
+  // paths can use the captured bytes when writing to the ISR cache.
+  //   __rscForResponse  → sent to the client (RSC response) or to SSR (HTML response)
+  //   __isrRscDataPromise → resolves to ArrayBuffer of captured RSC wire bytes
+  let __rscForResponse = rscStream;
+  let __isrRscDataPromise = null;
+  if (process.env.NODE_ENV === "production" && revalidateSeconds !== null && revalidateSeconds > 0 && revalidateSeconds !== Infinity && !isForceDynamic) {
+    const [__rscA, __rscB] = rscStream.tee();
+    __rscForResponse = __rscA;
+    __isrRscDataPromise = (async () => {
+      const __rscReader = __rscB.getReader();
+      const __rscChunks = [];
+      let __rscTotal = 0;
+      for (;;) {
+        const { done, value } = await __rscReader.read();
+        if (done) break;
+        __rscChunks.push(value);
+        __rscTotal += value.byteLength;
+      }
+      const __rscBuf = new Uint8Array(__rscTotal);
+      let __rscOff = 0;
+      for (const c of __rscChunks) { __rscBuf.set(c, __rscOff); __rscOff += c.byteLength; }
+      return __rscBuf.buffer;
+    })();
+  }
 
   if (isRscRequest) {
     // Direct RSC stream response (for client-side navigation)
@@ -2237,6 +2611,9 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
     if (isForceDynamic) {
       responseHeaders["Cache-Control"] = "no-store, must-revalidate";
     } else if ((isForceStatic || isDynamicError) && !revalidateSeconds) {
+      responseHeaders["Cache-Control"] = "s-maxage=31536000, stale-while-revalidate";
+      responseHeaders["X-Vinext-Cache"] = "STATIC";
+    } else if (revalidateSeconds === Infinity) {
       responseHeaders["Cache-Control"] = "s-maxage=31536000, stale-while-revalidate";
       responseHeaders["X-Vinext-Cache"] = "STATIC";
     } else if (revalidateSeconds) {
@@ -2288,7 +2665,26 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
       const compileMs = __compileEnd !== undefined ? Math.round(__compileEnd - __reqStart) : -1;
       responseHeaders["x-vinext-timing"] = handlerStart + "," + compileMs + ",-1";
     }
-    return new Response(rscStream, { status: _mwCtx.status || 200, headers: responseHeaders });
+    // For ISR-eligible RSC requests in production: write rscData to its own key.
+    // HTML is stored under a separate key (written by the HTML path below) so
+    // these writes never race or clobber each other.
+    if (process.env.NODE_ENV === "production" && __isrRscDataPromise) {
+      responseHeaders["X-Vinext-Cache"] = "MISS";
+      const __isrKeyRsc = __isrRscKey(cleanPathname);
+      const __revalSecsRsc = revalidateSeconds;
+      const __rscWritePromise = (async () => {
+        try {
+          const __rscDataForCache = await __isrRscDataPromise;
+          const __pageTags = __pageCacheTags(cleanPathname, getCollectedFetchTags());
+          await __isrSet(__isrKeyRsc, { kind: "APP_PAGE", html: "", rscData: __rscDataForCache, headers: undefined, postponed: undefined, status: 200 }, __revalSecsRsc, __pageTags);
+          __isrDebug?.("RSC cache written", __isrKeyRsc);
+        } catch (__rscWriteErr) {
+          console.error("[vinext] ISR RSC cache write error:", __rscWriteErr);
+        }
+      })();
+      _getRequestExecutionContext()?.waitUntil(__rscWritePromise);
+    }
+    return new Response(__rscForResponse, { status: _mwCtx.status || 200, headers: responseHeaders });
   }
 
   // Collect font data from RSC environment before passing to SSR
@@ -2309,20 +2705,43 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
   }
   const fontLinkHeader = fontLinkHeaderParts.length > 0 ? fontLinkHeaderParts.join(", ") : "";
 
+  // __rscForResponse was already teed above (before isRscRequest) for ISR pages in
+  // production. For non-ISR or dev, __rscForResponse === rscStream (no tee).
+  // __isrRscDataPromise resolves to rscData bytes used by the RSC write path above;
+  // the HTML write path below uses its own separate key and does not need rscData.
+
   // Delegate to SSR environment for HTML rendering
   let htmlStream;
   try {
     const ssrEntry = await import.meta.viteRsc.loadModule("ssr", "index");
-    htmlStream = await ssrEntry.handleSsr(rscStream, _getNavigationContext(), fontData);
+    htmlStream = await ssrEntry.handleSsr(__rscForResponse, _getNavigationContext(), fontData);
     // Shell render complete; Suspense boundaries stream asynchronously
     if (process.env.NODE_ENV !== "production") __renderEnd = performance.now();
   } catch (ssrErr) {
     const specialResponse = await handleRenderError(ssrErr);
     if (specialResponse) return specialResponse;
     // Non-special error during SSR — render error.tsx if available
-    const errorBoundaryResp = await renderErrorBoundaryPage(route, ssrErr, isRscRequest, request);
+    const errorBoundaryResp = await renderErrorBoundaryPage(route, ssrErr, isRscRequest, request, params);
     if (errorBoundaryResp) return errorBoundaryResp;
     throw ssrErr;
+  }
+
+  // If an RSC error was caught by the in-tree global ErrorBoundary during SSR,
+  // the HTML output has double <html>/<body> (root layout + global-error.tsx).
+  // Discard it and re-render using renderErrorBoundaryPage which skips layouts
+  // when the error falls through to global-error.tsx.
+  ${
+    globalErrorVar
+      ? `
+  if (_rscErrorForRerender && !isRscRequest) {
+    const _hasLocalBoundary = !!(route?.error?.default) || !!(route?.errors && route.errors.some(function(e) { return e?.default; }));
+    if (!_hasLocalBoundary) {
+      const cleanResp = await renderErrorBoundaryPage(route, _rscErrorForRerender, false, request, params);
+      if (cleanResp) return cleanResp;
+    }
+  }
+  `
+      : ""
   }
 
   // Check for draftMode Set-Cookie header (from draftMode().enable()/disable())
@@ -2401,8 +2820,8 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
   // force-static / error: treat as static regardless of dynamic usage.
   // force-static intentionally provides empty headers/cookies context so
   // dynamic APIs return safe defaults; we ignore the dynamic usage signal.
-  // dynamic='error' should have already thrown (via throwing Proxy) if user
-  // code accessed dynamic APIs, so reaching here means rendering succeeded.
+  // dynamic='error' should have already thrown via the request API accessError
+  // trap if user code touched a dynamic API, so reaching here means rendering succeeded.
   if ((isForceStatic || isDynamicError) && (revalidateSeconds === null || revalidateSeconds === 0)) {
     return attachMiddlewareContext(new Response(htmlStream, {
       headers: {
@@ -2426,13 +2845,89 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
     }));
   }
 
-  // Emit Cache-Control for ISR pages so tests can verify revalidate values,
-  // but skip actual caching in dev — every request renders fresh.
-  if (revalidateSeconds !== null && revalidateSeconds > 0) {
+  // Emit Cache-Control for ISR pages and write to ISR cache on MISS (production only).
+  // revalidate=Infinity means "cache forever" (no periodic revalidation) — treated as
+  // static here so we emit s-maxage=31536000 but skip ISR cache management.
+  if (revalidateSeconds !== null && revalidateSeconds > 0 && revalidateSeconds !== Infinity) {
+    // In production, tee the HTML response body to simultaneously stream to the
+    // client and collect the full HTML string for the ISR cache. rscData was
+    // already captured above by teeing the RSC stream before SSR.
+    // In dev, skip the tee and the X-Vinext-Cache header — every request renders
+    // fresh (no cache reads or writes in dev mode).
+    if (process.env.NODE_ENV === "production") {
+      const __isrResponseProd = attachMiddlewareContext(new Response(htmlStream, {
+        headers: {
+          "Content-Type": "text/html; charset=utf-8",
+          "Cache-Control": "s-maxage=" + revalidateSeconds + ", stale-while-revalidate",
+          "Vary": "RSC, Accept",
+          "X-Vinext-Cache": "MISS",
+        },
+      }));
+      if (__isrResponseProd.body) {
+        const [__streamForClient, __streamForCache] = __isrResponseProd.body.tee();
+        const __isrKey = __isrHtmlKey(cleanPathname);
+        const __isrKeyRscFromHtml = __isrRscKey(cleanPathname);
+        const __revalSecs = revalidateSeconds;
+        const __capturedRscDataPromise = __isrRscDataPromise;
+        const __cachePromise = (async () => {
+          try {
+            const __reader = __streamForCache.getReader();
+            const __decoder = new TextDecoder();
+            const __chunks = [];
+            for (;;) {
+              const { done, value } = await __reader.read();
+              if (done) break;
+              __chunks.push(__decoder.decode(value, { stream: true }));
+            }
+            __chunks.push(__decoder.decode());
+            const __fullHtml = __chunks.join("");
+            const __pageTags = __pageCacheTags(cleanPathname, getCollectedFetchTags());
+            // Write HTML and RSC to their own keys independently.
+            // RSC data was captured by the tee above (before isRscRequest branch)
+            // so an initial browser visit (HTML request) also populates the RSC key,
+            // ensuring the first client-side navigation after a direct visit is a
+            // cache hit rather than a miss.
+            const __writes = [
+              __isrSet(__isrKey, { kind: "APP_PAGE", html: __fullHtml, rscData: undefined, headers: undefined, postponed: undefined, status: 200 }, __revalSecs, __pageTags),
+            ];
+            if (__capturedRscDataPromise) {
+              __writes.push(
+                __capturedRscDataPromise.then((__rscBuf) =>
+                  __isrSet(__isrKeyRscFromHtml, { kind: "APP_PAGE", html: "", rscData: __rscBuf, headers: undefined, postponed: undefined, status: 200 }, __revalSecs, __pageTags)
+                )
+              );
+            }
+            await Promise.all(__writes);
+            __isrDebug?.("HTML cache written", __isrKey);
+          } catch (__cacheErr) {
+            console.error("[vinext] ISR cache write error:", __cacheErr);
+          }
+        })();
+        // Register with ExecutionContext (from ALS) so the Workers runtime keeps
+        // the isolate alive until the cache write finishes, even after the response is sent.
+        _getRequestExecutionContext()?.waitUntil(__cachePromise);
+        return new Response(__streamForClient, { status: __isrResponseProd.status, headers: __isrResponseProd.headers });
+      }
+      return __isrResponseProd;
+    }
+    // Dev mode: return Cache-Control header but no X-Vinext-Cache (no cache read/write)
     return attachMiddlewareContext(new Response(htmlStream, {
       headers: {
         "Content-Type": "text/html; charset=utf-8",
         "Cache-Control": "s-maxage=" + revalidateSeconds + ", stale-while-revalidate",
+        "Vary": "RSC, Accept",
+      },
+    }));
+  }
+
+  // revalidate=Infinity (or false, which Next.js normalises to false/0): treat as
+  // permanent static — emit the longest safe s-maxage but skip ISR cache management.
+  if (revalidateSeconds === Infinity) {
+    return attachMiddlewareContext(new Response(htmlStream, {
+      headers: {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "s-maxage=31536000, stale-while-revalidate",
+        "X-Vinext-Cache": "STATIC",
         "Vary": "RSC, Accept",
       },
     }));
@@ -2446,774 +2941,5 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
 if (import.meta.hot) {
   import.meta.hot.accept();
 }
-`;
-}
-
-/**
- * Generate the virtual SSR entry module.
- *
- * This runs in the `ssr` Vite environment. It receives an RSC stream,
- * deserializes it to a React tree, and renders to HTML.
- */
-export function generateSsrEntry(): string {
-  return `
-import { createFromReadableStream } from "@vitejs/plugin-rsc/ssr";
-import { renderToReadableStream, renderToStaticMarkup } from "react-dom/server.edge";
-import { setNavigationContext, ServerInsertedHTMLContext } from "next/navigation";
-import { runWithNavigationContext as _runWithNavCtx } from "vinext/navigation-state";
-import { safeJsonStringify } from "vinext/html";
-import { createElement as _ssrCE } from "react";
-
-/**
- * Collect all chunks from a ReadableStream into an array of text strings.
- * Used to capture the RSC payload for embedding in HTML.
- * The RSC flight protocol is text-based (line-delimited key:value pairs),
- * so we decode to text strings instead of byte arrays — this is dramatically
- * more compact when JSON-serialized into inline <script> tags.
- */
-async function collectStreamChunks(stream) {
-  const reader = stream.getReader();
-  const decoder = new TextDecoder();
-  const chunks = [];
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    // Decode Uint8Array to text string for compact JSON serialization
-    chunks.push(decoder.decode(value, { stream: true }));
-  }
-  return chunks;
-}
-
-// React 19 dev-mode workaround (see VinextFlightRoot in handleSsr):
-//
-// In dev, Flight error decoding in react-server-dom-webpack/client.edge
-// can hit resolveErrorDev() which (via React's dev error stack capture)
-// expects a non-null hooks dispatcher.
-//
-// Vinext previously called createFromReadableStream() outside of any React render.
-// When an RSC stream contains an error, dev-mode decoding could crash with:
-//   - "Invalid hook call"
-//   - "Cannot read properties of null (reading 'useContext')"
-//
-// Fix: call createFromReadableStream() lazily inside a React component render.
-// This mirrors Next.js behavior and ensures the dispatcher is set.
-
-/**
- * Create a TransformStream that appends RSC chunks as inline <script> tags
- * to the HTML stream. This allows progressive hydration — the browser receives
- * RSC data incrementally as Suspense boundaries resolve, rather than waiting
- * for the entire RSC payload before hydration can begin.
- *
- * Each chunk is written as:
- *   <script>self.__VINEXT_RSC_CHUNKS__=self.__VINEXT_RSC_CHUNKS__||[];self.__VINEXT_RSC_CHUNKS__.push("...")</script>
- *
- * Chunks are embedded as text strings (not byte arrays) since the RSC flight
- * protocol is text-based. The browser entry encodes them back to Uint8Array.
- * This is ~3x more compact than the previous byte-array format.
- */
-function createRscEmbedTransform(embedStream) {
-  const reader = embedStream.getReader();
-  const _decoder = new TextDecoder();
-  let done = false;
-  let pendingChunks = [];
-  let reading = false;
-
-  // Fix invalid preload "as" values in RSC Flight hint lines before
-  // they reach the client. React Flight emits HL hints with
-  // as="stylesheet" for CSS, but the HTML spec requires as="style"
-  // for <link rel="preload">. The fixPreloadAs() below only fixes the
-  // server-rendered HTML stream; this fixes the raw Flight data that
-  // gets embedded as __VINEXT_RSC_CHUNKS__ and processed client-side.
-  function fixFlightHints(text) {
-    // Flight hint format: <id>:HL["url","stylesheet"] or with options
-    return text.replace(/(\\d+:HL\\[.*?),"stylesheet"(\\]|,)/g, '$1,"style"$2');
-  }
-
-  // Start reading RSC chunks in the background, accumulating them as text strings.
-  // The RSC flight protocol is text-based, so decoding to strings and embedding
-  // as JSON strings is ~3x more compact than the byte-array format.
-  async function pumpReader() {
-    if (reading) return;
-    reading = true;
-    try {
-      while (true) {
-        const result = await reader.read();
-        if (result.done) {
-          done = true;
-          break;
-        }
-        const text = _decoder.decode(result.value, { stream: true });
-        pendingChunks.push(fixFlightHints(text));
-      }
-    } catch (err) {
-      if (process.env.NODE_ENV !== "production") {
-        console.warn("[vinext] RSC embed stream read error:", err);
-      }
-      done = true;
-    }
-    reading = false;
-  }
-
-  // Fire off the background reader immediately
-  const pumpPromise = pumpReader();
-
-  return {
-    /**
-     * Flush any accumulated RSC chunks as <script> tags.
-     * Called after each HTML chunk is enqueued.
-     */
-    flush() {
-      if (pendingChunks.length === 0) return "";
-      const chunks = pendingChunks;
-      pendingChunks = [];
-      let scripts = "";
-      for (const chunk of chunks) {
-        scripts += "<script>self.__VINEXT_RSC_CHUNKS__=self.__VINEXT_RSC_CHUNKS__||[];self.__VINEXT_RSC_CHUNKS__.push(" + safeJsonStringify(chunk) + ")</script>";
-      }
-      return scripts;
-    },
-
-    /**
-     * Wait for the RSC stream to fully complete and return any final
-     * script tags plus the closing signal.
-     */
-    async finalize() {
-      await pumpPromise;
-      let scripts = this.flush();
-      // Signal that all RSC chunks have been sent.
-      // Params are already embedded in <head> — no need to include here.
-      scripts += "<script>self.__VINEXT_RSC_DONE__=true</script>";
-      return scripts;
-    },
-  };
-}
-
-/**
- * Render the RSC stream to HTML.
- *
- * @param rscStream - The RSC payload stream from the RSC environment
- * @param navContext - Navigation context for client component SSR hooks.
- *   "use client" components like those using usePathname() need the current
- *   request URL during SSR, and they run in this SSR environment (separate
- *   from the RSC environment where the context was originally set).
- * @param fontData - Font links and styles collected from the RSC environment.
- *   Fonts are loaded during RSC rendering (when layout calls Geist() etc.),
- *   and the data needs to be passed to SSR since they're separate module instances.
- */
-export async function handleSsr(rscStream, navContext, fontData) {
-  // Wrap in a navigation ALS scope for per-request isolation in the SSR
-  // environment. The SSR environment has separate module instances from RSC,
-  // so it needs its own ALS scope.
-  return _runWithNavCtx(async () => {
-  // Set navigation context so hooks like usePathname() work during SSR
-  // of "use client" components
-  if (navContext) {
-    setNavigationContext(navContext);
-  }
-
-  // Clear any stale callbacks from previous requests
-  const { clearServerInsertedHTML, flushServerInsertedHTML, useServerInsertedHTML: _addInsertedHTML } = await import("next/navigation");
-  clearServerInsertedHTML();
-
-  try {
-    // Tee the RSC stream - one for SSR rendering, one for embedding in HTML.
-    // This ensures the browser uses the SAME RSC payload for hydration that
-    // was used to generate the HTML, avoiding hydration mismatches (React #418).
-    const [ssrStream, embedStream] = rscStream.tee();
-
-    // Create the progressive RSC embed helper — it reads the embed stream
-    // in the background and provides script tags to inject into the HTML stream.
-    const rscEmbed = createRscEmbedTransform(embedStream);
-
-    // Deserialize RSC stream back to React VDOM.
-    // IMPORTANT: Do NOT await this — createFromReadableStream returns a thenable
-    // that React's renderToReadableStream can consume progressively. By passing
-    // the unresolved thenable, React will render Suspense fallbacks (loading.tsx)
-    // immediately in the HTML shell, then stream in resolved content as RSC
-    // chunks arrive. Awaiting here would block until all async server components
-    // complete, collapsing the streaming behavior.
-    // Lazily create the Flight root inside render so React's hook dispatcher is set
-    // (avoids React 19 dev-mode resolveErrorDev() crash). VinextFlightRoot returns
-    // a thenable (not a ReactNode), which React 19 consumes via its internal
-    // thenable-as-child suspend/resume behavior. This matches Next.js's approach.
-    let flightRoot;
-    function VinextFlightRoot() {
-      if (!flightRoot) {
-        flightRoot = createFromReadableStream(ssrStream);
-      }
-      return flightRoot;
-    }
-    const root = _ssrCE(VinextFlightRoot);
-
-    // Wrap with ServerInsertedHTMLContext.Provider so libraries that use
-    // useContext(ServerInsertedHTMLContext) (Apollo Client, styled-components,
-    // etc.) get a working callback registration function during SSR.
-    // The provider value is useServerInsertedHTML — same function that direct
-    // callers use — so both paths push to the same ALS-backed callback array.
-    const ssrRoot = ServerInsertedHTMLContext
-      ? _ssrCE(ServerInsertedHTMLContext.Provider, { value: _addInsertedHTML }, root)
-      : root;
-
-    // Get the bootstrap script content for the browser entry
-    const bootstrapScriptContent =
-      await import.meta.viteRsc.loadBootstrapScriptContent("index");
-
-    // djb2 hash for digest generation in the SSR environment.
-    // Matches the RSC environment's __errorDigest function.
-    function ssrErrorDigest(str) {
-      let hash = 5381;
-      for (let i = str.length - 1; i >= 0; i--) {
-        hash = (hash * 33) ^ str.charCodeAt(i);
-      }
-      return (hash >>> 0).toString();
-    }
-
-    // Render HTML (streaming SSR)
-    // useServerInsertedHTML callbacks are registered during this render.
-    // The onError callback preserves the digest for Next.js navigation errors
-    // (redirect, notFound, forbidden, unauthorized) thrown inside Suspense
-    // boundaries during RSC streaming. Without this, React's default onError
-    // returns undefined and the digest is lost in the $RX() call, preventing
-    // client-side error boundaries from identifying the error type.
-    // In production, non-navigation errors also get a digest hash so they
-    // can be correlated with server logs without leaking details to clients.
-    const htmlStream = await renderToReadableStream(ssrRoot, {
-      bootstrapScriptContent,
-      onError(error) {
-        if (error && typeof error === "object" && "digest" in error) {
-          return String(error.digest);
-        }
-        // In production, generate a digest hash for non-navigation errors
-        if (process.env.NODE_ENV === "production" && error) {
-          const msg = error instanceof Error ? error.message : String(error);
-          const stack = error instanceof Error ? (error.stack || "") : "";
-          return ssrErrorDigest(msg + stack);
-        }
-        return undefined;
-      },
-    });
-
-
-    // Flush useServerInsertedHTML callbacks (CSS-in-JS style injection)
-    const insertedElements = flushServerInsertedHTML();
-
-    // Render the inserted elements to HTML strings
-    const { Fragment } = await import("react");
-    let insertedHTML = "";
-    for (const el of insertedElements) {
-      try {
-        insertedHTML += renderToStaticMarkup(_ssrCE(Fragment, null, el));
-      } catch {
-        // Skip elements that can't be rendered
-      }
-    }
-
-    // Escape HTML attribute values (defense-in-depth for font URLs/types).
-    function _escAttr(s) { return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;"); }
-
-    // Build font HTML from data passed from RSC environment
-    // (Fonts are loaded during RSC rendering, and RSC/SSR are separate module instances)
-    let fontHTML = "";
-    if (fontData) {
-      if (fontData.links && fontData.links.length > 0) {
-        for (const url of fontData.links) {
-          fontHTML += '<link rel="stylesheet" href="' + _escAttr(url) + '" />\\n';
-        }
-      }
-      // Emit <link rel="preload"> for local font files
-      if (fontData.preloads && fontData.preloads.length > 0) {
-        for (const preload of fontData.preloads) {
-          fontHTML += '<link rel="preload" href="' + _escAttr(preload.href) + '" as="font" type="' + _escAttr(preload.type) + '" crossorigin />\\n';
-        }
-      }
-      if (fontData.styles && fontData.styles.length > 0) {
-        fontHTML += '<style data-vinext-fonts>' + fontData.styles.join("\\n") + '</style>\\n';
-      }
-    }
-
-    // Extract client entry module URL from bootstrapScriptContent to emit
-    // a <link rel="modulepreload"> hint. The RSC plugin formats bootstrap
-    // content as: import("URL") — we extract the URL so the browser can
-    // speculatively fetch and parse the JS module while still processing
-    // the HTML body, instead of waiting until it reaches the inline script.
-    let modulePreloadHTML = "";
-    if (bootstrapScriptContent) {
-      const m = bootstrapScriptContent.match(/import\\("([^"]+)"\\)/);
-      if (m && m[1]) {
-        modulePreloadHTML = '<link rel="modulepreload" href="' + _escAttr(m[1]) + '" />\\n';
-      }
-    }
-
-    // Head-injected HTML: server-inserted HTML, font HTML, route params,
-    // and modulepreload hints.
-    // RSC payload is now embedded progressively via script tags in the body stream.
-    // Params are embedded eagerly in <head> so they're available before client
-    // hydration starts, avoiding the need for polling on the client.
-    const paramsScript = '<script>self.__VINEXT_RSC_PARAMS__=' + safeJsonStringify(navContext?.params || {}) + '</script>';
-    const injectHTML = paramsScript + modulePreloadHTML + insertedHTML + fontHTML;
-
-    // Inject the collected HTML before </head> and progressively embed RSC
-    // chunks as script tags throughout the HTML body stream.
-    const decoder = new TextDecoder();
-    const encoder = new TextEncoder();
-    let injected = false;
-
-    // Fix invalid preload "as" values in server-rendered HTML.
-    // React Fizz emits <link rel="preload" as="stylesheet"> for CSS,
-    // but the HTML spec requires as="style" for <link rel="preload">.
-    // Note: fixFlightHints() in createRscEmbedTransform handles the
-    // complementary case — fixing the raw Flight stream data before
-    // it's embedded as __VINEXT_RSC_CHUNKS__ for client-side processing.
-    // See: https://html.spec.whatwg.org/multipage/links.html#link-type-preload
-    function fixPreloadAs(html) {
-      // Match <link ...rel="preload"... as="stylesheet"...> in any attribute order
-      return html.replace(/<link(?=[^>]*\\srel="preload")[^>]*>/g, function(tag) {
-        return tag.replace(' as="stylesheet"', ' as="style"');
-      });
-    }
-
-    // Tick-buffered RSC script injection.
-    //
-    // React's renderToReadableStream (Fizz) flushes chunks synchronously
-    // within one microtask — all chunks from a single flushCompletedQueues
-    // call arrive in the same macrotask. We buffer HTML chunks as they
-    // arrive, then use setTimeout(0) to defer emitting them plus any
-    // accumulated RSC scripts to the next macrotask. This guarantees we
-    // never inject <script> tags between partial HTML chunks (which would
-    // corrupt split elements like "<linearGradi" + "ent>"), while still
-    // delivering RSC data progressively as Suspense boundaries resolve.
-    //
-    // Reference: rsc-html-stream by Devon Govett (credited by Next.js)
-    // https://github.com/devongovett/rsc-html-stream
-    let buffered = [];
-    let timeoutId = null;
-
-    const transform = new TransformStream({
-      transform(chunk, controller) {
-        const text = decoder.decode(chunk, { stream: true });
-        const fixed = fixPreloadAs(text);
-        buffered.push(fixed);
-
-        if (timeoutId !== null) return;
-
-        timeoutId = setTimeout(() => {
-          // Flush all buffered HTML chunks from this React flush cycle
-          for (const buf of buffered) {
-            if (!injected) {
-              const headEnd = buf.indexOf("</head>");
-              if (headEnd !== -1) {
-                const before = buf.slice(0, headEnd);
-                const after = buf.slice(headEnd);
-                controller.enqueue(encoder.encode(before + injectHTML + after));
-                injected = true;
-                continue;
-              }
-            }
-            controller.enqueue(encoder.encode(buf));
-          }
-          buffered = [];
-
-          // Now safe to inject any accumulated RSC scripts — we're between
-          // React flush cycles, so no partial HTML chunks can follow until
-          // the next macrotask.
-          const rscScripts = rscEmbed.flush();
-          if (rscScripts) {
-            controller.enqueue(encoder.encode(rscScripts));
-          }
-
-          timeoutId = null;
-        }, 0);
-      },
-      async flush(controller) {
-        // Cancel any pending setTimeout callback — flush() drains
-        // everything itself, so the callback would be a no-op but
-        // cancelling makes the code obviously correct.
-        if (timeoutId !== null) {
-          clearTimeout(timeoutId);
-          timeoutId = null;
-        }
-
-        // Flush any remaining buffered HTML chunks
-        for (const buf of buffered) {
-          if (!injected) {
-            const headEnd = buf.indexOf("</head>");
-            if (headEnd !== -1) {
-              const before = buf.slice(0, headEnd);
-              const after = buf.slice(headEnd);
-              controller.enqueue(encoder.encode(before + injectHTML + after));
-              injected = true;
-              continue;
-            }
-          }
-          controller.enqueue(encoder.encode(buf));
-        }
-        buffered = [];
-
-        if (!injected && injectHTML) {
-          controller.enqueue(encoder.encode(injectHTML));
-        }
-        // Finalize: wait for the RSC stream to complete and emit remaining
-        // chunks plus the __VINEXT_RSC_DONE__ signal.
-        const finalScripts = await rscEmbed.finalize();
-        if (finalScripts) {
-          controller.enqueue(encoder.encode(finalScripts));
-        }
-      },
-    });
-
-    return htmlStream.pipeThrough(transform);
-  } finally {
-    // Clean up so we don't leak context between requests
-    setNavigationContext(null);
-    clearServerInsertedHTML();
-  }
-  }); // end _runWithNavCtx
-}
-
-export default {
-  async fetch(request) {
-    const url = new URL(request.url);
-    if (url.pathname.startsWith("//")) {
-      return new Response("404 Not Found", { status: 404 });
-    }
-    const rscModule = await import.meta.viteRsc.loadModule("rsc", "index");
-    const result = await rscModule.default(request);
-    if (result instanceof Response) {
-      return result;
-    }
-    if (result === null || result === undefined) {
-      return new Response("Not Found", { status: 404 });
-    }
-    return new Response(String(result), { status: 200 });
-  },
-};
-`;
-}
-
-/**
- * Generate the virtual browser entry module.
- *
- * This runs in the client (browser). It hydrates the page from the
- * embedded RSC payload and handles client-side navigation by re-fetching
- * RSC streams.
- */
-export function generateBrowserEntry(): string {
-  return `
-import {
-  createFromReadableStream,
-  createFromFetch,
-  setServerCallback,
-  encodeReply,
-  createTemporaryReferenceSet,
-} from "@vitejs/plugin-rsc/browser";
-import { hydrateRoot } from "react-dom/client";
-import { flushSync } from "react-dom";
-import { setClientParams, toRscUrl, getPrefetchCache, getPrefetchedUrls, PREFETCH_CACHE_TTL } from "next/navigation";
-
-let reactRoot;
-
-/**
- * Convert the embedded RSC chunks back to a ReadableStream.
- * Each chunk is a text string that needs to be encoded back to Uint8Array.
- */
-function chunksToReadableStream(chunks) {
-  const encoder = new TextEncoder();
-  return new ReadableStream({
-    start(controller) {
-      for (const chunk of chunks) {
-        controller.enqueue(encoder.encode(chunk));
-      }
-      controller.close();
-    }
-  });
-}
-
-/**
- * Create a ReadableStream from progressively-embedded RSC chunks.
- * The server injects RSC data as <script> tags that push to
- * self.__VINEXT_RSC_CHUNKS__ throughout the HTML stream, and sets
- * self.__VINEXT_RSC_DONE__ = true when complete.
- *
- * Instead of polling with setTimeout, we monkey-patch the array's
- * push() method so new chunks are delivered immediately when the
- * server's <script> tags execute. This eliminates unnecessary
- * wakeups and reduces latency — same pattern Next.js uses with
- * __next_f. The stream closes on DOMContentLoaded (when all
- * server-injected scripts have executed) or when __VINEXT_RSC_DONE__
- * is set, whichever comes first.
- */
-function createProgressiveRscStream() {
-  const encoder = new TextEncoder();
-  return new ReadableStream({
-    start(controller) {
-      const chunks = self.__VINEXT_RSC_CHUNKS__ || [];
-
-      // Deliver any chunks that arrived before this code ran
-      // (from <script> tags that executed before the browser entry loaded)
-      for (const chunk of chunks) {
-        controller.enqueue(encoder.encode(chunk));
-      }
-
-      // If the stream is already complete, close immediately
-      if (self.__VINEXT_RSC_DONE__) {
-        controller.close();
-        return;
-      }
-
-      // Monkey-patch push() so future chunks stream in immediately
-      // when the server's <script> tags execute
-      let closed = false;
-      function closeOnce() {
-        if (!closed) {
-          closed = true;
-          controller.close();
-        }
-      }
-
-      const arr = self.__VINEXT_RSC_CHUNKS__ = self.__VINEXT_RSC_CHUNKS__ || [];
-      arr.push = function(chunk) {
-        Array.prototype.push.call(this, chunk);
-        if (!closed) {
-          controller.enqueue(encoder.encode(chunk));
-          if (self.__VINEXT_RSC_DONE__) {
-            closeOnce();
-          }
-        }
-        return this.length;
-      };
-
-      // Safety net: if the server crashes mid-stream and __VINEXT_RSC_DONE__
-      // never arrives, close the stream when all server-injected scripts
-      // have executed (DOMContentLoaded). Without this, a truncated response
-      // leaves the ReadableStream open forever, hanging hydration.
-      if (typeof document !== "undefined") {
-        if (document.readyState === "loading") {
-          document.addEventListener("DOMContentLoaded", closeOnce);
-        } else {
-          // Document already loaded — close immediately if not already done
-          closeOnce();
-        }
-      }
-    }
-  });
-}
-
-// Register the server action callback — React calls this internally
-// when a "use server" function is invoked from client code.
-setServerCallback(async (id, args) => {
-  const temporaryReferences = createTemporaryReferenceSet();
-  const body = await encodeReply(args, { temporaryReferences });
-
-  const fetchResponse = await fetch(toRscUrl(window.location.pathname + window.location.search), {
-    method: "POST",
-    headers: { "x-rsc-action": id },
-    body,
-  });
-
-  // Check for redirect signal from server action that called redirect()
-  const actionRedirect = fetchResponse.headers.get("x-action-redirect");
-  if (actionRedirect) {
-    // External URLs (different origin) need a hard redirect — client-side
-    // RSC navigation only works for same-origin paths.
-    try {
-      const redirectUrl = new URL(actionRedirect, window.location.origin);
-      if (redirectUrl.origin !== window.location.origin) {
-        window.location.href = actionRedirect;
-        return undefined;
-      }
-    } catch {
-      // If URL parsing fails, fall through to client-side navigation
-    }
-
-    // Navigate to the redirect target using client-side navigation
-    const redirectType = fetchResponse.headers.get("x-action-redirect-type") || "replace";
-    if (redirectType === "push") {
-      window.history.pushState(null, "", actionRedirect);
-    } else {
-      window.history.replaceState(null, "", actionRedirect);
-    }
-    // Trigger RSC navigation to the redirect target
-    if (typeof window.__VINEXT_RSC_NAVIGATE__ === "function") {
-      window.__VINEXT_RSC_NAVIGATE__(actionRedirect);
-    }
-    return undefined;
-  }
-
-  const result = await createFromFetch(Promise.resolve(fetchResponse), { temporaryReferences });
-
-  // The RSC response for actions contains { root, returnValue }.
-  // Re-render the page with the updated tree.
-  if (result && typeof result === "object" && "root" in result) {
-    reactRoot.render(result.root);
-    // Return the action's return value to the caller
-    if (result.returnValue) {
-      if (!result.returnValue.ok) throw result.returnValue.data;
-      return result.returnValue.data;
-    }
-    return undefined;
-  }
-
-  // Fallback: render the entire result as the tree
-  reactRoot.render(result);
-  return result;
-});
-
-async function main() {
-  let rscStream;
-
-  // Use embedded RSC data for initial hydration if available.
-  // This ensures we use the SAME RSC payload that generated the HTML,
-  // avoiding hydration mismatches (React error #418).
-  //
-  // The server embeds RSC chunks progressively as <script> tags that push
-  // to self.__VINEXT_RSC_CHUNKS__. When complete, self.__VINEXT_RSC_DONE__
-  // is set and self.__VINEXT_RSC_PARAMS__ contains route params.
-  // For backwards compat, also check the legacy self.__VINEXT_RSC__ format.
-  if (self.__VINEXT_RSC_CHUNKS__ || self.__VINEXT_RSC_DONE__ || self.__VINEXT_RSC__) {
-    if (self.__VINEXT_RSC__) {
-      // Legacy format: single object with all chunks
-      const embedData = self.__VINEXT_RSC__;
-      delete self.__VINEXT_RSC__;
-      if (embedData.params) {
-        setClientParams(embedData.params);
-      }
-      rscStream = chunksToReadableStream(embedData.rsc);
-    } else {
-      // Progressive format: chunks arrive incrementally via script tags.
-      // Params are embedded in <head> so they're always available by this point.
-      if (self.__VINEXT_RSC_PARAMS__) {
-        setClientParams(self.__VINEXT_RSC_PARAMS__);
-      }
-      rscStream = createProgressiveRscStream();
-    }
-  } else {
-    // Fallback: fetch fresh RSC (shouldn't happen on initial page load)
-    const rscResponse = await fetch(toRscUrl(window.location.pathname + window.location.search));
-
-    // Hydrate useParams() with route params from the server before React hydration
-    const paramsHeader = rscResponse.headers.get("X-Vinext-Params");
-    if (paramsHeader) {
-      try { setClientParams(JSON.parse(paramsHeader)); } catch (_e) { /* ignore */ }
-    }
-
-    rscStream = rscResponse.body;
-  }
-
-  const root = await createFromReadableStream(rscStream);
-
-  // Hydrate the document
-  // In development, suppress Vite's error overlay for errors caught by React error
-  // boundaries. Without this, React re-throws caught errors to the global handler,
-  // which triggers Vite's overlay even though the error was handled by an error.tsx.
-  // In production, preserve React's default onCaughtError (console.error) so
-  // boundary-caught errors remain visible to error monitoring.
-  reactRoot = hydrateRoot(document, root, import.meta.env.DEV ? {
-    onCaughtError: function() {},
-  } : undefined);
-
-  // Store for client-side navigation
-  window.__VINEXT_RSC_ROOT__ = reactRoot;
-
-  // Client-side navigation handler
-  // Checks the prefetch cache (populated by <Link> IntersectionObserver and
-  // router.prefetch()) before making a network request. This makes navigation
-  // near-instant for prefetched routes.
-  window.__VINEXT_RSC_NAVIGATE__ = async function navigateRsc(href, __redirectDepth) {
-    if ((__redirectDepth || 0) > 10) {
-      console.error("[vinext] Too many RSC redirects — aborting navigation to prevent infinite loop.");
-      window.location.href = href;
-      return;
-    }
-    try {
-      const url = new URL(href, window.location.origin);
-      const rscUrl = toRscUrl(url.pathname + url.search);
-
-      // Check the in-memory prefetch cache first
-      let navResponse;
-      const prefetchCache = getPrefetchCache();
-      const cached = prefetchCache.get(rscUrl);
-      if (cached && (Date.now() - cached.timestamp) < PREFETCH_CACHE_TTL) {
-        navResponse = cached.response;
-        prefetchCache.delete(rscUrl); // Consume the cached entry (one-time use)
-        getPrefetchedUrls().delete(rscUrl); // Allow re-prefetch when link is visible again
-      } else if (cached) {
-        prefetchCache.delete(rscUrl); // Expired, clean up
-        getPrefetchedUrls().delete(rscUrl);
-      }
-
-      // Fallback to network fetch if not in cache
-      if (!navResponse) {
-        navResponse = await fetch(rscUrl, {
-          headers: { Accept: "text/x-component" },
-          credentials: "include",
-        });
-      }
-
-      // Detect if fetch followed a redirect: compare the final response URL to
-      // what we requested. If they differ, the server issued a 3xx — push the
-      // canonical destination URL into history before rendering.
-      const __finalUrl = new URL(navResponse.url);
-      const __requestedUrl = new URL(rscUrl, window.location.origin);
-      if (__finalUrl.pathname !== __requestedUrl.pathname) {
-        // Strip .rsc suffix from the final URL to get the page path for history.
-        // Use replaceState instead of pushState: the caller (navigateImpl) already
-        // pushed the pre-redirect URL; replacing it avoids a stale history entry.
-        const __destPath = __finalUrl.pathname.replace(/\\.rsc$/, "") + __finalUrl.search;
-        window.history.replaceState(null, "", __destPath);
-        return window.__VINEXT_RSC_NAVIGATE__(__destPath, (__redirectDepth || 0) + 1);
-      }
-
-      // Update useParams() with route params from the server before re-rendering
-      const navParamsHeader = navResponse.headers.get("X-Vinext-Params");
-      if (navParamsHeader) {
-        try { setClientParams(JSON.parse(navParamsHeader)); } catch (_e) { /* ignore */ }
-      } else {
-        setClientParams({});
-      }
-
-      const rscPayload = await createFromFetch(Promise.resolve(navResponse));
-      // Use flushSync to guarantee React commits the new tree to the DOM
-      // synchronously before this function returns. Callers scroll to top
-      // after awaiting, so the new content must be painted first.
-      flushSync(function () { reactRoot.render(rscPayload); });
-    } catch (err) {
-      console.error("[vinext] RSC navigation error:", err);
-      // Fallback to full page load
-      window.location.href = href;
-    }
-  };
-
-  // Handle popstate (browser back/forward)
-  // Store the navigation promise on a well-known property so that
-  // restoreScrollPosition (in navigation.ts) can await it before scrolling.
-  // This prevents a flash where the old content is visible at the restored
-  // scroll position before the new RSC payload has rendered.
-  window.addEventListener("popstate", () => {
-    const p = window.__VINEXT_RSC_NAVIGATE__(window.location.href);
-    window.__VINEXT_RSC_PENDING__ = p;
-    p.finally(() => {
-      // Clear once settled so stale promises aren't awaited later
-      if (window.__VINEXT_RSC_PENDING__ === p) {
-        window.__VINEXT_RSC_PENDING__ = null;
-      }
-    });
-  });
-
-  // HMR: re-render on server module updates
-  if (import.meta.hot) {
-    import.meta.hot.on("rsc:update", async () => {
-      try {
-        const rscPayload = await createFromFetch(
-          fetch(toRscUrl(window.location.pathname + window.location.search))
-        );
-        reactRoot.render(rscPayload);
-      } catch (err) {
-        console.error("[vinext] RSC HMR error:", err);
-      }
-    });
-  }
-}
-
-main();
 `;
 }

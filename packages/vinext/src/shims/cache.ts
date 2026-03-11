@@ -121,10 +121,7 @@ export interface CacheHandlerContext {
 }
 
 export interface CacheHandler {
-  get(
-    key: string,
-    ctx?: Record<string, unknown>,
-  ): Promise<CacheHandlerValue | null>;
+  get(key: string, ctx?: Record<string, unknown>): Promise<CacheHandlerValue | null>;
 
   set(
     key: string,
@@ -132,10 +129,7 @@ export interface CacheHandler {
     ctx?: Record<string, unknown>,
   ): Promise<void>;
 
-  revalidateTag(
-    tags: string | string[],
-    durations?: { expire?: number },
-  ): Promise<void>;
+  revalidateTag(tags: string | string[], durations?: { expire?: number }): Promise<void>;
 
   resetRequestCache?(): void;
 }
@@ -156,10 +150,7 @@ export class MemoryCacheHandler implements CacheHandler {
   private store = new Map<string, MemoryEntry>();
   private tagRevalidatedAt = new Map<string, number>();
 
-  async get(
-    key: string,
-    _ctx?: Record<string, unknown>,
-  ): Promise<CacheHandlerValue | null> {
+  async get(key: string, _ctx?: Record<string, unknown>): Promise<CacheHandlerValue | null> {
     const entry = this.store.get(key);
     if (!entry) return null;
 
@@ -204,8 +195,7 @@ export class MemoryCacheHandler implements CacheHandler {
     let revalidateAt: number | null = null;
     if (ctx) {
       // Handle both old-style { revalidate } and new-style { cacheControl: { revalidate } }
-      const revalidate =
-        (ctx as any).cacheControl?.revalidate ?? (ctx as any).revalidate;
+      const revalidate = (ctx as any).cacheControl?.revalidate ?? (ctx as any).revalidate;
       if (typeof revalidate === "number" && revalidate > 0) {
         revalidateAt = Date.now() + revalidate * 1000;
       }
@@ -222,10 +212,7 @@ export class MemoryCacheHandler implements CacheHandler {
     });
   }
 
-  async revalidateTag(
-    tags: string | string[],
-    _durations?: { expire?: number },
-  ): Promise<void> {
+  async revalidateTag(tags: string | string[], _durations?: { expire?: number }): Promise<void> {
     const tagList = Array.isArray(tags) ? tags : [tags];
     const now = Date.now();
     for (const tag of tagList) {
@@ -240,11 +227,34 @@ export class MemoryCacheHandler implements CacheHandler {
 }
 
 // ---------------------------------------------------------------------------
-// Active cache handler — the singleton used by next/cache API functions.
-// Defaults to MemoryCacheHandler, can be swapped at runtime.
+// Request-scoped ExecutionContext ALS
+//
+// Re-exported from request-context.ts — the canonical implementation.
+// These exports are kept here for backward compatibility with any code that
+// imports them from "next/cache".
 // ---------------------------------------------------------------------------
 
-let activeHandler: CacheHandler = new MemoryCacheHandler();
+export type { ExecutionContextLike } from "./request-context.js";
+export { runWithExecutionContext, getRequestExecutionContext } from "./request-context.js";
+
+// ---------------------------------------------------------------------------
+// Active cache handler — the singleton used by next/cache API functions.
+// Defaults to MemoryCacheHandler, can be swapped at runtime.
+//
+// Stored on globalThis via Symbol.for so that setCacheHandler() called in the
+// Cloudflare Worker environment (worker/index.ts) is visible to getCacheHandler()
+// called in the RSC environment (generated RSC entry). Without this, the two
+// environments load separate module instances and operate on different
+// `activeHandler` variables — setCacheHandler sets KVCacheHandler in one copy,
+// but getCacheHandler returns MemoryCacheHandler from the other copy.
+// ---------------------------------------------------------------------------
+
+const _HANDLER_KEY = Symbol.for("vinext.cacheHandler");
+const _gHandler = globalThis as unknown as Record<PropertyKey, CacheHandler>;
+
+function _getActiveHandler(): CacheHandler {
+  return _gHandler[_HANDLER_KEY] ?? (_gHandler[_HANDLER_KEY] = new MemoryCacheHandler());
+}
 
 /**
  * Set a custom CacheHandler. Call this during server startup to
@@ -254,14 +264,14 @@ let activeHandler: CacheHandler = new MemoryCacheHandler();
  * as Next.js 16's CacheHandler class).
  */
 export function setCacheHandler(handler: CacheHandler): void {
-  activeHandler = handler;
+  _gHandler[_HANDLER_KEY] = handler;
 }
 
 /**
  * Get the active CacheHandler (for internal use or testing).
  */
 export function getCacheHandler(): CacheHandler {
-  return activeHandler;
+  return _getActiveHandler();
 }
 
 // ---------------------------------------------------------------------------
@@ -298,7 +308,7 @@ export async function revalidateTag(
   } else if (profile && typeof profile === "object") {
     durations = profile;
   }
-  await activeHandler.revalidateTag(tag, durations);
+  await _getActiveHandler().revalidateTag(tag, durations);
 }
 
 /**
@@ -307,13 +317,10 @@ export async function revalidateTag(
  * Under the hood, Next.js converts paths to internal tags.
  * We use a `_N_T_/path` prefix convention for path-based tags.
  */
-export async function revalidatePath(
-  path: string,
-  _type?: "page" | "layout",
-): Promise<void> {
+export async function revalidatePath(path: string, _type?: "page" | "layout"): Promise<void> {
   // Next.js internally converts paths to tags with a prefix
   const pathTag = `_N_T_${path}`;
-  await activeHandler.revalidateTag([path, pathTag]);
+  await _getActiveHandler().revalidateTag([path, pathTag]);
 }
 
 /**
@@ -330,7 +337,7 @@ export async function revalidatePath(
  */
 export async function updateTag(tag: string): Promise<void> {
   // Expire the tag immediately (same as revalidateTag without SWR)
-  await activeHandler.revalidateTag(tag);
+  await _getActiveHandler().revalidateTag(tag);
 }
 
 /**
@@ -383,7 +390,8 @@ interface CacheState {
 const _ALS_KEY = Symbol.for("vinext.cache.als");
 const _FALLBACK_KEY = Symbol.for("vinext.cache.fallback");
 const _g = globalThis as unknown as Record<PropertyKey, unknown>;
-const _cacheAls = (_g[_ALS_KEY] ??= new AsyncLocalStorage<CacheState>()) as AsyncLocalStorage<CacheState>;
+const _cacheAls = (_g[_ALS_KEY] ??=
+  new AsyncLocalStorage<CacheState>()) as AsyncLocalStorage<CacheState>;
 
 const _cacheFallbackState = (_g[_FALLBACK_KEY] ??= {
   requestScopedCacheLife: null,
@@ -432,19 +440,22 @@ export function _setRequestScopedCacheLife(config: CacheLifeConfig): void {
   } else {
     // Minimum-wins rule
     if (config.stale !== undefined) {
-      state.requestScopedCacheLife.stale = state.requestScopedCacheLife.stale !== undefined
-        ? Math.min(state.requestScopedCacheLife.stale, config.stale)
-        : config.stale;
+      state.requestScopedCacheLife.stale =
+        state.requestScopedCacheLife.stale !== undefined
+          ? Math.min(state.requestScopedCacheLife.stale, config.stale)
+          : config.stale;
     }
     if (config.revalidate !== undefined) {
-      state.requestScopedCacheLife.revalidate = state.requestScopedCacheLife.revalidate !== undefined
-        ? Math.min(state.requestScopedCacheLife.revalidate, config.revalidate)
-        : config.revalidate;
+      state.requestScopedCacheLife.revalidate =
+        state.requestScopedCacheLife.revalidate !== undefined
+          ? Math.min(state.requestScopedCacheLife.revalidate, config.revalidate)
+          : config.revalidate;
     }
     if (config.expire !== undefined) {
-      state.requestScopedCacheLife.expire = state.requestScopedCacheLife.expire !== undefined
-        ? Math.min(state.requestScopedCacheLife.expire, config.expire)
-        : config.expire;
+      state.requestScopedCacheLife.expire =
+        state.requestScopedCacheLife.expire !== undefined
+          ? Math.min(state.requestScopedCacheLife.expire, config.expire)
+          : config.expire;
     }
   }
 }
@@ -521,9 +532,7 @@ export function cacheLife(profile: string | CacheLifeConfig): void {
       profile.revalidate !== undefined &&
       profile.expire < profile.revalidate
     ) {
-      console.warn(
-        "[vinext] cacheLife: expire must be >= revalidate",
-      );
+      console.warn("[vinext] cacheLife: expire must be >= revalidate");
     }
     resolvedConfig = { ...profile };
   } else {
@@ -578,9 +587,21 @@ export function cacheTag(...tags: string[]): void {
  * a direct import (avoiding circular dependencies).
  */
 const _UNSTABLE_CACHE_ALS_KEY = Symbol.for("vinext.unstableCache.als");
-const _unstableCacheAls = (
-  (_g[_UNSTABLE_CACHE_ALS_KEY] ??= new AsyncLocalStorage<boolean>()) as AsyncLocalStorage<boolean>
-);
+const _unstableCacheAls = (_g[_UNSTABLE_CACHE_ALS_KEY] ??=
+  new AsyncLocalStorage<boolean>()) as AsyncLocalStorage<boolean>;
+const UNSTABLE_CACHE_UNDEFINED_SENTINEL = "__vinext_unstable_cache_undefined__";
+
+function serializeUnstableCacheResult(value: unknown): string {
+  return value === undefined ? UNSTABLE_CACHE_UNDEFINED_SENTINEL : JSON.stringify(value);
+}
+
+function deserializeUnstableCacheResult(body: string): unknown {
+  if (body === UNSTABLE_CACHE_UNDEFINED_SENTINEL) {
+    return undefined;
+  }
+
+  return JSON.parse(body);
+}
 
 /**
  * Check if the current execution context is inside an unstable_cache() callback.
@@ -607,9 +628,7 @@ export function unstable_cache<T extends (...args: any[]) => Promise<any>>(
   keyParts?: string[],
   options?: UnstableCacheOptions,
 ): T {
-  const baseKey = keyParts
-    ? keyParts.join(":")
-    : fnv1a64(fn.toString());
+  const baseKey = keyParts ? keyParts.join(":") : fnv1a64(fn.toString());
   const tags = options?.tags ?? [];
   const revalidateSeconds = options?.revalidate;
 
@@ -619,13 +638,13 @@ export function unstable_cache<T extends (...args: any[]) => Promise<any>>(
 
     // Try to get from cache. Check cacheState so time-expired entries
     // trigger a re-fetch instead of being served indefinitely.
-    const existing = await activeHandler.get(cacheKey, {
+    const existing = await _getActiveHandler().get(cacheKey, {
       kind: "FETCH",
       tags,
     });
     if (existing?.value && existing.value.kind === "FETCH" && existing.cacheState !== "stale") {
       try {
-        return JSON.parse(existing.value.data.body);
+        return deserializeUnstableCacheResult(existing.value.data.body);
       } catch {
         // Corrupted entry, fall through to re-fetch
       }
@@ -641,7 +660,7 @@ export function unstable_cache<T extends (...args: any[]) => Promise<any>>(
       kind: "FETCH",
       data: {
         headers: {},
-        body: JSON.stringify(result),
+        body: serializeUnstableCacheResult(result),
         url: cacheKey,
       },
       tags,
@@ -652,7 +671,7 @@ export function unstable_cache<T extends (...args: any[]) => Promise<any>>(
       revalidate: typeof revalidateSeconds === "number" ? revalidateSeconds : false,
     };
 
-    await activeHandler.set(cacheKey, cacheValue, {
+    await _getActiveHandler().set(cacheKey, cacheValue, {
       fetchCache: true,
       tags,
       revalidate: revalidateSeconds,

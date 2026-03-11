@@ -17,6 +17,7 @@ import {
   getRevalidateDuration,
   triggerBackgroundRegeneration,
 } from "../packages/vinext/src/server/isr-cache.js";
+import { runWithExecutionContext } from "../packages/vinext/src/shims/request-context.js";
 
 // ─── isrCacheKey ────────────────────────────────────────────────────────
 
@@ -65,6 +66,33 @@ describe("isrCacheKey", () => {
     const path1 = "/" + "a".repeat(250);
     const path2 = "/" + "b".repeat(250);
     expect(isrCacheKey("pages", path1)).not.toBe(isrCacheKey("pages", path2));
+  });
+
+  it("includes buildId in key when provided", () => {
+    expect(isrCacheKey("pages", "/about", "abc123")).toBe("pages:abc123:/about");
+  });
+
+  it("includes buildId in app router key", () => {
+    expect(isrCacheKey("app", "/dashboard", "build-42")).toBe("app:build-42:/dashboard");
+  });
+
+  it("preserves root with buildId", () => {
+    expect(isrCacheKey("pages", "/", "v1")).toBe("pages:v1:/");
+  });
+
+  it("strips trailing slash with buildId", () => {
+    expect(isrCacheKey("pages", "/about/", "v1")).toBe("pages:v1:/about");
+  });
+
+  it("hashes long paths with buildId", () => {
+    const longPath = "/" + "a".repeat(250);
+    const key = isrCacheKey("pages", longPath, "build-99");
+    expect(key).toMatch(/^pages:build-99:__hash:/);
+  });
+
+  it("without buildId format is unchanged (backward compat)", () => {
+    expect(isrCacheKey("pages", "/about")).toBe("pages:/about");
+    expect(isrCacheKey("app", "/dashboard")).toBe("app:/dashboard");
   });
 });
 
@@ -142,13 +170,15 @@ describe("triggerBackgroundRegeneration", () => {
     const renderFn = vi.fn().mockResolvedValue(undefined);
     triggerBackgroundRegeneration("regen-test-1", renderFn);
     // Wait for the async operation
-    await new Promise(resolve => setTimeout(resolve, 10));
+    await new Promise((resolve) => setTimeout(resolve, 10));
     expect(renderFn).toHaveBeenCalledOnce();
   });
 
   it("deduplicates concurrent regeneration for same key", async () => {
     let resolveFirst: () => void;
-    const firstPromise = new Promise<void>(r => { resolveFirst = r; });
+    const firstPromise = new Promise<void>((r) => {
+      resolveFirst = r;
+    });
     const renderFn1 = vi.fn().mockReturnValue(firstPromise);
     const renderFn2 = vi.fn().mockResolvedValue(undefined);
 
@@ -161,19 +191,19 @@ describe("triggerBackgroundRegeneration", () => {
 
     // Complete the first
     resolveFirst!();
-    await new Promise(resolve => setTimeout(resolve, 10));
+    await new Promise((resolve) => setTimeout(resolve, 10));
   });
 
   it("allows regeneration after previous completes", async () => {
     const renderFn1 = vi.fn().mockResolvedValue(undefined);
     triggerBackgroundRegeneration("regen-test-3", renderFn1);
-    await new Promise(resolve => setTimeout(resolve, 10));
+    await new Promise((resolve) => setTimeout(resolve, 10));
     expect(renderFn1).toHaveBeenCalledOnce();
 
     // After completion, a new regeneration should be allowed
     const renderFn2 = vi.fn().mockResolvedValue(undefined);
     triggerBackgroundRegeneration("regen-test-3", renderFn2);
-    await new Promise(resolve => setTimeout(resolve, 10));
+    await new Promise((resolve) => setTimeout(resolve, 10));
     expect(renderFn2).toHaveBeenCalledOnce();
   });
 
@@ -182,7 +212,7 @@ describe("triggerBackgroundRegeneration", () => {
     const renderFn = vi.fn().mockRejectedValue(new Error("render failed"));
 
     triggerBackgroundRegeneration("regen-test-4", renderFn);
-    await new Promise(resolve => setTimeout(resolve, 10));
+    await new Promise((resolve) => setTimeout(resolve, 10));
 
     expect(renderFn).toHaveBeenCalledOnce();
     expect(consoleError).toHaveBeenCalled();
@@ -190,7 +220,7 @@ describe("triggerBackgroundRegeneration", () => {
     // After error, key should be cleared so new regeneration is possible
     const renderFn2 = vi.fn().mockResolvedValue(undefined);
     triggerBackgroundRegeneration("regen-test-4", renderFn2);
-    await new Promise(resolve => setTimeout(resolve, 10));
+    await new Promise((resolve) => setTimeout(resolve, 10));
     expect(renderFn2).toHaveBeenCalledOnce();
 
     consoleError.mockRestore();
@@ -203,8 +233,37 @@ describe("triggerBackgroundRegeneration", () => {
     triggerBackgroundRegeneration("regen-test-5a", renderFnA);
     triggerBackgroundRegeneration("regen-test-5b", renderFnB);
 
-    await new Promise(resolve => setTimeout(resolve, 10));
+    await new Promise((resolve) => setTimeout(resolve, 10));
     expect(renderFnA).toHaveBeenCalledOnce();
     expect(renderFnB).toHaveBeenCalledOnce();
+  });
+
+  it("calls ctx.waitUntil with the regen promise when ctx is in ALS", async () => {
+    const waitUntil = vi.fn();
+    const ctx = { waitUntil };
+
+    let resolveRender: () => void;
+    const renderPromise = new Promise<void>((r) => {
+      resolveRender = r;
+    });
+    const renderFn = vi.fn().mockReturnValue(renderPromise);
+
+    await runWithExecutionContext(ctx, async () => {
+      triggerBackgroundRegeneration("regen-ctx-1", renderFn);
+    });
+
+    expect(waitUntil).toHaveBeenCalledOnce();
+    expect(waitUntil).toHaveBeenCalledWith(expect.any(Promise));
+
+    resolveRender!();
+    await renderPromise;
+  });
+
+  it("does not require ctx — works without it", async () => {
+    const renderFn = vi.fn().mockResolvedValue(undefined);
+    // No ctx passed — should not throw
+    triggerBackgroundRegeneration("regen-no-ctx", renderFn);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(renderFn).toHaveBeenCalledOnce();
   });
 });

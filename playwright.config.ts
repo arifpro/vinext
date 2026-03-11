@@ -8,9 +8,9 @@ import { defineConfig } from "@playwright/test";
 const projectServers = {
   "pages-router": {
     testDir: "./tests/e2e/pages-router",
+    use: { baseURL: "http://localhost:4173" },
     server: {
-      command:
-        "npx tsc -p ../../../packages/vinext/tsconfig.json && npx vite --port 4173",
+      command: "npx tsc -p ../../../packages/vinext/tsconfig.json && npx vite --port 4173",
       cwd: "./tests/fixtures/pages-basic",
       port: 4173,
       reuseExistingServer: !process.env.CI,
@@ -18,7 +18,8 @@ const projectServers = {
     },
   },
   "app-router": {
-    testDir: "./tests/e2e/app-router",
+    testDir: "./tests/e2e",
+    testMatch: ["**/app-router/**/*.spec.ts", "**/og-image.spec.ts"],
     use: { baseURL: "http://localhost:4174" },
     server: {
       command: "npx vite --port 4174",
@@ -29,7 +30,12 @@ const projectServers = {
     },
   },
   "cloudflare-pages-router": {
-    testDir: "./tests/e2e/cloudflare-pages-router",
+    testDir: "./tests/e2e",
+    testMatch: [
+      "**/cloudflare-pages-router/**/*.spec.ts",
+      "**/pages-router/instrumentation-startup.spec.ts",
+    ],
+    use: { baseURL: "http://localhost:4177" },
     server: {
       command: "npx vite build && npx wrangler dev --port 4177",
       cwd: "./examples/pages-router-cloudflare",
@@ -56,12 +62,12 @@ const projectServers = {
     testMatch: [
       "**/cloudflare-workers/**/*.spec.ts",
       "**/app-router/instrumentation.spec.ts",
+      "**/og-image.spec.ts",
     ],
     use: { baseURL: "http://localhost:4176" },
     server: {
       // Build app-router-cloudflare with Vite, then serve with wrangler dev (miniflare)
-      command:
-        "npx vite build && npx wrangler dev --config dist/server/wrangler.json --port 4176",
+      command: "npx vite build && npx wrangler dev --config dist/server/wrangler.json --port 4176",
       cwd: "./examples/app-router-cloudflare",
       port: 4176,
       reuseExistingServer: !process.env.CI,
@@ -73,6 +79,7 @@ const projectServers = {
     testMatch: [
       "**/cloudflare-dev/**/*.spec.ts",
       "**/app-router/instrumentation.spec.ts",
+      "**/og-image.spec.ts",
     ],
     use: { baseURL: "http://localhost:4178" },
     server: {
@@ -81,6 +88,21 @@ const projectServers = {
       command: "npx vite --port 4178",
       cwd: "./examples/app-router-cloudflare",
       port: 4178,
+      reuseExistingServer: !process.env.CI,
+      timeout: 30_000,
+    },
+  },
+  "cloudflare-pages-router-dev": {
+    testDir: "./tests/e2e",
+    testMatch: [
+      "**/cloudflare-pages-router-dev/**/*.spec.ts",
+      "**/pages-router/instrumentation-startup.spec.ts",
+    ],
+    use: { baseURL: "http://localhost:4179" },
+    server: {
+      command: "npx vite --port 4179",
+      cwd: "./examples/pages-router-cloudflare",
+      port: 4179,
       reuseExistingServer: !process.env.CI,
       timeout: 30_000,
     },

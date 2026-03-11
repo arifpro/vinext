@@ -10,12 +10,20 @@
  * all behavior is tested indirectly through handleApiRoute with a mocked
  * ViteDevServer.
  */
-import { describe, it, expect, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { PassThrough } from "node:stream";
 import http from "node:http";
+vi.mock("../packages/vinext/src/server/instrumentation.js", () => ({
+  reportRequestError: vi.fn(() => Promise.resolve()),
+}));
 import { handleApiRoute } from "../packages/vinext/src/server/api-handler.js";
+import { reportRequestError } from "../packages/vinext/src/server/instrumentation.js";
 import type { Route } from "../packages/vinext/src/routing/pages-router.js";
 import type { ViteDevServer } from "vite";
+
+beforeEach(() => {
+  vi.clearAllMocks();
+});
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -66,7 +74,7 @@ function mockReq(
  * Create a mock ServerResponse that captures status, headers, and body.
  */
 function mockRes(): http.ServerResponse & {
-  _body: string;
+  _body: string | Buffer;
   _headers: Record<string, string>;
   _statusCode: number;
   _ended: boolean;
@@ -93,7 +101,7 @@ function mockRes(): http.ServerResponse & {
         }
       }
     },
-    end(data?: string) {
+    end(data?: string | Buffer) {
       if (data !== undefined) {
         res._body = data;
       }
@@ -101,7 +109,7 @@ function mockRes(): http.ServerResponse & {
       res._statusCode = res.statusCode;
     },
   } as unknown as http.ServerResponse & {
-    _body: string;
+    _body: string | Buffer;
     _headers: Record<string, string>;
     _statusCode: number;
     _ended: boolean;
@@ -114,18 +122,14 @@ function mockRes(): http.ServerResponse & {
  */
 function route(pattern: string, filePath = "/fake/api/handler.ts"): Route {
   const isDynamic = pattern.includes(":");
-  const params = isDynamic
-    ? [...pattern.matchAll(/:(\w+)/g)].map((m) => m[1])
-    : [];
-  return { pattern, filePath, isDynamic, params };
+  const params = isDynamic ? [...pattern.matchAll(/:(\w+)/g)].map((m) => m[1]) : [];
+  return { pattern, patternParts: pattern.split("/").filter(Boolean), filePath, isDynamic, params };
 }
 
 /**
  * Build a minimal mock ViteDevServer with configurable ssrLoadModule behavior.
  */
-function mockServer(
-  moduleExport: Record<string, unknown>,
-): ViteDevServer {
+function mockServer(moduleExport: Record<string, unknown>): ViteDevServer {
   return {
     ssrLoadModule: vi.fn().mockResolvedValue(moduleExport),
     ssrFixStacktrace: vi.fn(),
@@ -144,13 +148,9 @@ describe("handleApiRoute", () => {
       const req = mockReq("GET", "/api/nonexistent");
       const res = mockRes();
 
-      const handled = await handleApiRoute(
-        server,
-        req,
-        res,
-        "/api/nonexistent",
-        [route("/api/users")],
-      );
+      const handled = await handleApiRoute(server, req, res, "/api/nonexistent", [
+        route("/api/users"),
+      ]);
 
       expect(handled).toBe(false);
       expect(handler).not.toHaveBeenCalled();
@@ -162,13 +162,7 @@ describe("handleApiRoute", () => {
       const req = mockReq("GET", "/api/users");
       const res = mockRes();
 
-      const handled = await handleApiRoute(
-        server,
-        req,
-        res,
-        "/api/users",
-        [route("/api/users")],
-      );
+      const handled = await handleApiRoute(server, req, res, "/api/users", [route("/api/users")]);
 
       expect(handled).toBe(true);
       expect(handler).toHaveBeenCalledOnce();
@@ -190,29 +184,48 @@ describe("handleApiRoute", () => {
       });
       const res = mockRes();
 
-      await handleApiRoute(server, req, res, "/api/users", [
-        route("/api/users"),
-      ]);
+      await handleApiRoute(server, req, res, "/api/users", [route("/api/users")]);
 
       expect(capturedBody).toEqual({ name: "Alice", age: 30 });
     });
 
-    it("falls back to raw string for malformed JSON", async () => {
-      let capturedBody: unknown;
-      const handler = vi.fn((req: any) => {
-        capturedBody = req.body;
-      });
+    // Ported from Next.js: test/integration/api-support/test/index.test.ts
+    // https://github.com/vercel/next.js/blob/canary/test/integration/api-support/test/index.test.ts
+    it("returns 400 for malformed JSON instead of calling the handler", async () => {
+      const handler = vi.fn();
       const server = mockServer({ default: handler });
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
       const req = mockReq("POST", "/api/users", "{not json", {
         "content-type": "application/json",
       });
       const res = mockRes();
 
-      await handleApiRoute(server, req, res, "/api/users", [
-        route("/api/users"),
-      ]);
+      await handleApiRoute(server, req, res, "/api/users", [route("/api/users")]);
 
-      expect(capturedBody).toBe("{not json");
+      expect(handler).not.toHaveBeenCalled();
+      expect(res._statusCode).toBe(400);
+      expect(res.statusMessage).toBe("Invalid JSON");
+      expect(res._body).toBe("Invalid JSON");
+      expect(server.ssrFixStacktrace).not.toHaveBeenCalled();
+      expect(errorSpy).not.toHaveBeenCalled();
+      expect(reportRequestError).not.toHaveBeenCalled();
+      errorSpy.mockRestore();
+    });
+
+    it("parses empty application/json bodies as an empty object", async () => {
+      let capturedBody: unknown;
+      const handler = vi.fn((req: any) => {
+        capturedBody = req.body;
+      });
+      const server = mockServer({ default: handler });
+      const req = mockReq("POST", "/api/users", "", {
+        "content-type": "application/json",
+      });
+      const res = mockRes();
+
+      await handleApiRoute(server, req, res, "/api/users", [route("/api/users")]);
+
+      expect(capturedBody).toEqual({});
     });
 
     it("parses application/x-www-form-urlencoded body", async () => {
@@ -226,11 +239,57 @@ describe("handleApiRoute", () => {
       });
       const res = mockRes();
 
-      await handleApiRoute(server, req, res, "/api/users", [
-        route("/api/users"),
-      ]);
+      await handleApiRoute(server, req, res, "/api/users", [route("/api/users")]);
 
       expect(capturedBody).toEqual({ name: "Alice", role: "admin" });
+    });
+
+    it("preserves duplicate application/x-www-form-urlencoded keys as arrays", async () => {
+      let capturedBody: unknown;
+      const handler = vi.fn((req: any) => {
+        capturedBody = req.body;
+      });
+      const server = mockServer({ default: handler });
+      const req = mockReq("POST", "/api/users", "tag=a&tag=b&tag=c", {
+        "content-type": "application/x-www-form-urlencoded",
+      });
+      const res = mockRes();
+
+      await handleApiRoute(server, req, res, "/api/users", [route("/api/users")]);
+
+      expect(capturedBody).toEqual({ tag: ["a", "b", "c"] });
+    });
+
+    it("parses empty application/x-www-form-urlencoded bodies as an empty object", async () => {
+      let capturedBody: unknown;
+      const handler = vi.fn((req: any) => {
+        capturedBody = req.body;
+      });
+      const server = mockServer({ default: handler });
+      const req = mockReq("POST", "/api/users", "", {
+        "content-type": "application/x-www-form-urlencoded",
+      });
+      const res = mockRes();
+
+      await handleApiRoute(server, req, res, "/api/users", [route("/api/users")]);
+
+      expect(capturedBody).toEqual({});
+    });
+
+    it("parses application/ld+json bodies as JSON", async () => {
+      let capturedBody: unknown;
+      const handler = vi.fn((req: any) => {
+        capturedBody = req.body;
+      });
+      const server = mockServer({ default: handler });
+      const req = mockReq("POST", "/api/users", JSON.stringify({ title: "doc" }), {
+        "content-type": "application/ld+json; charset=utf-8",
+      });
+      const res = mockRes();
+
+      await handleApiRoute(server, req, res, "/api/users", [route("/api/users")]);
+
+      expect(capturedBody).toEqual({ title: "doc" });
     });
 
     it("returns raw string for unknown content-type", async () => {
@@ -244,9 +303,7 @@ describe("handleApiRoute", () => {
       });
       const res = mockRes();
 
-      await handleApiRoute(server, req, res, "/api/users", [
-        route("/api/users"),
-      ]);
+      await handleApiRoute(server, req, res, "/api/users", [route("/api/users")]);
 
       expect(capturedBody).toBe("plain text body");
     });
@@ -260,9 +317,7 @@ describe("handleApiRoute", () => {
       const req = mockReq("GET", "/api/users");
       const res = mockRes();
 
-      await handleApiRoute(server, req, res, "/api/users", [
-        route("/api/users"),
-      ]);
+      await handleApiRoute(server, req, res, "/api/users", [route("/api/users")]);
 
       expect(capturedBody).toBeUndefined();
     });
@@ -276,9 +331,7 @@ describe("handleApiRoute", () => {
       const req = mockReq("POST", "/api/users", "some data");
       const res = mockRes();
 
-      await handleApiRoute(server, req, res, "/api/users", [
-        route("/api/users"),
-      ]);
+      await handleApiRoute(server, req, res, "/api/users", [route("/api/users")]);
 
       expect(capturedBody).toBe("some data");
     });
@@ -329,9 +382,7 @@ describe("handleApiRoute", () => {
         }
       });
 
-      await handleApiRoute(server, req, res, "/api/upload", [
-        route("/api/upload"),
-      ]);
+      await handleApiRoute(server, req, res, "/api/upload", [route("/api/upload")]);
 
       expect(handler).not.toHaveBeenCalled();
       expect(res._statusCode).toBe(413);
@@ -352,9 +403,7 @@ describe("handleApiRoute", () => {
       });
       const res = mockRes();
 
-      await handleApiRoute(server, req, res, "/api/upload", [
-        route("/api/upload"),
-      ]);
+      await handleApiRoute(server, req, res, "/api/upload", [route("/api/upload")]);
 
       expect(handler).toHaveBeenCalledOnce();
       expect(capturedBody).toBe(body);
@@ -375,9 +424,7 @@ describe("handleApiRoute", () => {
       });
       const res = mockRes();
 
-      await handleApiRoute(server, req, res, "/api/users", [
-        route("/api/users"),
-      ]);
+      await handleApiRoute(server, req, res, "/api/users", [route("/api/users")]);
 
       expect(capturedCookies).toEqual({ session: "abc123" });
     });
@@ -393,9 +440,7 @@ describe("handleApiRoute", () => {
       });
       const res = mockRes();
 
-      await handleApiRoute(server, req, res, "/api/users", [
-        route("/api/users"),
-      ]);
+      await handleApiRoute(server, req, res, "/api/users", [route("/api/users")]);
 
       expect(capturedCookies).toEqual({
         session: "abc123",
@@ -415,9 +460,7 @@ describe("handleApiRoute", () => {
       });
       const res = mockRes();
 
-      await handleApiRoute(server, req, res, "/api/users", [
-        route("/api/users"),
-      ]);
+      await handleApiRoute(server, req, res, "/api/users", [route("/api/users")]);
 
       expect(capturedCookies).toEqual({ token: "abc=def=ghi" });
     });
@@ -431,9 +474,7 @@ describe("handleApiRoute", () => {
       const req = mockReq("GET", "/api/users");
       const res = mockRes();
 
-      await handleApiRoute(server, req, res, "/api/users", [
-        route("/api/users"),
-      ]);
+      await handleApiRoute(server, req, res, "/api/users", [route("/api/users")]);
 
       expect(capturedCookies).toEqual({});
     });
@@ -452,13 +493,11 @@ describe("handleApiRoute", () => {
       const req = mockReq("POST", "/api/users");
       const res = mockRes();
 
-      await handleApiRoute(server, req, res, "/api/users", [
-        route("/api/users"),
-      ]);
+      await handleApiRoute(server, req, res, "/api/users", [route("/api/users")]);
 
       expect(res._statusCode).toBe(201);
       expect(res._headers["content-type"]).toBe("application/json");
-      expect(JSON.parse(res._body)).toEqual({ ok: true });
+      expect(JSON.parse(res._body as string)).toEqual({ ok: true });
     });
   });
 
@@ -471,12 +510,10 @@ describe("handleApiRoute", () => {
       const req = mockReq("GET", "/api/users");
       const res = mockRes();
 
-      await handleApiRoute(server, req, res, "/api/users", [
-        route("/api/users"),
-      ]);
+      await handleApiRoute(server, req, res, "/api/users", [route("/api/users")]);
 
       expect(res._headers["content-type"]).toBe("application/json");
-      expect(JSON.parse(res._body)).toEqual({ message: "hello" });
+      expect(JSON.parse(res._body as string)).toEqual({ message: "hello" });
     });
 
     it("serializes nested objects", async () => {
@@ -488,11 +525,9 @@ describe("handleApiRoute", () => {
       const req = mockReq("GET", "/api/users");
       const res = mockRes();
 
-      await handleApiRoute(server, req, res, "/api/users", [
-        route("/api/users"),
-      ]);
+      await handleApiRoute(server, req, res, "/api/users", [route("/api/users")]);
 
-      expect(JSON.parse(res._body)).toEqual(data);
+      expect(JSON.parse(res._body as string)).toEqual(data);
     });
   });
 
@@ -505,12 +540,10 @@ describe("handleApiRoute", () => {
       const req = mockReq("GET", "/api/users");
       const res = mockRes();
 
-      await handleApiRoute(server, req, res, "/api/users", [
-        route("/api/users"),
-      ]);
+      await handleApiRoute(server, req, res, "/api/users", [route("/api/users")]);
 
       expect(res._headers["content-type"]).toBe("application/json");
-      expect(JSON.parse(res._body)).toEqual({ key: "value" });
+      expect(JSON.parse(res._body as string)).toEqual({ key: "value" });
     });
 
     it("sends string data as text/plain", async () => {
@@ -521,12 +554,26 @@ describe("handleApiRoute", () => {
       const req = mockReq("GET", "/api/users");
       const res = mockRes();
 
-      await handleApiRoute(server, req, res, "/api/users", [
-        route("/api/users"),
-      ]);
+      await handleApiRoute(server, req, res, "/api/users", [route("/api/users")]);
 
       expect(res._headers["content-type"]).toBe("text/plain");
       expect(res._body).toBe("hello world");
+    });
+
+    it("sends Buffer data as application/octet-stream bytes", async () => {
+      const handler = vi.fn((_req: any, res: any) => {
+        res.send(Buffer.from([1, 2, 3]));
+      });
+      const server = mockServer({ default: handler });
+      const req = mockReq("GET", "/api/users");
+      const res = mockRes();
+
+      await handleApiRoute(server, req, res, "/api/users", [route("/api/users")]);
+
+      expect(res._headers["content-type"]).toBe("application/octet-stream");
+      expect(res._headers["content-length"]).toBe("3");
+      expect(Buffer.isBuffer(res._body)).toBe(true);
+      expect((res._body as Buffer).equals(Buffer.from([1, 2, 3]))).toBe(true);
     });
 
     it("sends number data as text/plain string", async () => {
@@ -537,9 +584,7 @@ describe("handleApiRoute", () => {
       const req = mockReq("GET", "/api/users");
       const res = mockRes();
 
-      await handleApiRoute(server, req, res, "/api/users", [
-        route("/api/users"),
-      ]);
+      await handleApiRoute(server, req, res, "/api/users", [route("/api/users")]);
 
       expect(res._headers["content-type"]).toBe("text/plain");
       expect(res._body).toBe("42");
@@ -554,9 +599,7 @@ describe("handleApiRoute", () => {
       const req = mockReq("GET", "/api/page");
       const res = mockRes();
 
-      await handleApiRoute(server, req, res, "/api/page", [
-        route("/api/page"),
-      ]);
+      await handleApiRoute(server, req, res, "/api/page", [route("/api/page")]);
 
       expect(res._headers["content-type"]).toBe("text/html");
       expect(res._body).toBe("<h1>Hello</h1>");
@@ -572,9 +615,7 @@ describe("handleApiRoute", () => {
       const req = mockReq("GET", "/api/users");
       const res = mockRes();
 
-      await handleApiRoute(server, req, res, "/api/users", [
-        route("/api/users"),
-      ]);
+      await handleApiRoute(server, req, res, "/api/users", [route("/api/users")]);
 
       expect(res._headers["content-type"]).toBe("text/plain");
       expect(res._body).toBe("null");
@@ -590,9 +631,7 @@ describe("handleApiRoute", () => {
       const req = mockReq("GET", "/api/login");
       const res = mockRes();
 
-      await handleApiRoute(server, req, res, "/api/login", [
-        route("/api/login"),
-      ]);
+      await handleApiRoute(server, req, res, "/api/login", [route("/api/login")]);
 
       expect(res._statusCode).toBe(307);
       expect(res._headers["location"]).toBe("/dashboard");
@@ -607,9 +646,7 @@ describe("handleApiRoute", () => {
       const req = mockReq("GET", "/api/old");
       const res = mockRes();
 
-      await handleApiRoute(server, req, res, "/api/old", [
-        route("/api/old"),
-      ]);
+      await handleApiRoute(server, req, res, "/api/old", [route("/api/old")]);
 
       expect(res._statusCode).toBe(301);
       expect(res._headers["location"]).toBe("/new-location");
@@ -623,9 +660,7 @@ describe("handleApiRoute", () => {
       const req = mockReq("GET", "/api/external");
       const res = mockRes();
 
-      await handleApiRoute(server, req, res, "/api/external", [
-        route("/api/external"),
-      ]);
+      await handleApiRoute(server, req, res, "/api/external", [route("/api/external")]);
 
       expect(res._statusCode).toBe(302);
       expect(res._headers["location"]).toBe("https://external.com");
@@ -644,9 +679,7 @@ describe("handleApiRoute", () => {
       const req = mockReq("GET", "/api/users?page=2&limit=10");
       const res = mockRes();
 
-      await handleApiRoute(server, req, res, "/api/users?page=2&limit=10", [
-        route("/api/users"),
-      ]);
+      await handleApiRoute(server, req, res, "/api/users?page=2&limit=10", [route("/api/users")]);
 
       expect(capturedQuery.page).toBe("2");
       expect(capturedQuery.limit).toBe("10");
@@ -661,9 +694,7 @@ describe("handleApiRoute", () => {
       const req = mockReq("GET", "/api/users/42");
       const res = mockRes();
 
-      await handleApiRoute(server, req, res, "/api/users/42", [
-        route("/api/users/:id"),
-      ]);
+      await handleApiRoute(server, req, res, "/api/users/42", [route("/api/users/:id")]);
 
       expect(capturedQuery.id).toBe("42");
     });
@@ -677,13 +708,9 @@ describe("handleApiRoute", () => {
       const req = mockReq("GET", "/api/users/42?fields=name,email");
       const res = mockRes();
 
-      await handleApiRoute(
-        server,
-        req,
-        res,
-        "/api/users/42?fields=name,email",
-        [route("/api/users/:id")],
-      );
+      await handleApiRoute(server, req, res, "/api/users/42?fields=name,email", [
+        route("/api/users/:id"),
+      ]);
 
       expect(capturedQuery.id).toBe("42");
       expect(capturedQuery.fields).toBe("name,email");
@@ -698,11 +725,28 @@ describe("handleApiRoute", () => {
       const req = mockReq("GET", "/api/users?tag=a&tag=b");
       const res = mockRes();
 
-      await handleApiRoute(server, req, res, "/api/users?tag=a&tag=b", [
+      await handleApiRoute(server, req, res, "/api/users?tag=a&tag=b", [route("/api/users")]);
+
+      expect(capturedQuery.tag).toEqual(["a", "b"]);
+    });
+
+    it("treats prototype property names as ordinary query keys", async () => {
+      let capturedQuery: Record<string, string | string[]> = {};
+      const handler = vi.fn((req: any) => {
+        capturedQuery = req.query;
+      });
+      const server = mockServer({ default: handler });
+      const req = mockReq("GET", "/api/users?toString=a&constructor=b&__proto__=c");
+      const res = mockRes();
+
+      await handleApiRoute(server, req, res, "/api/users?toString=a&constructor=b&__proto__=c", [
         route("/api/users"),
       ]);
 
-      expect(capturedQuery.tag).toEqual(["a", "b"]);
+      expect(capturedQuery.toString).toBe("a");
+      expect(capturedQuery.constructor).toBe("b");
+      expect(capturedQuery.__proto__).toBe("c");
+      expect(Object.getPrototypeOf(capturedQuery)).toBe(Object.prototype);
     });
 
     it("returns empty query for URL with no query string", async () => {
@@ -714,9 +758,7 @@ describe("handleApiRoute", () => {
       const req = mockReq("GET", "/api/users");
       const res = mockRes();
 
-      await handleApiRoute(server, req, res, "/api/users", [
-        route("/api/users"),
-      ]);
+      await handleApiRoute(server, req, res, "/api/users", [route("/api/users")]);
 
       expect(capturedQuery).toEqual({});
     });
@@ -730,9 +772,7 @@ describe("handleApiRoute", () => {
       const req = mockReq("GET", "/api/users");
       const res = mockRes();
 
-      const handled = await handleApiRoute(server, req, res, "/api/users", [
-        route("/api/users"),
-      ]);
+      const handled = await handleApiRoute(server, req, res, "/api/users", [route("/api/users")]);
 
       expect(handled).toBe(true);
       expect(res._statusCode).toBe(500);
@@ -744,9 +784,7 @@ describe("handleApiRoute", () => {
       const req = mockReq("GET", "/api/users");
       const res = mockRes();
 
-      const handled = await handleApiRoute(server, req, res, "/api/users", [
-        route("/api/users"),
-      ]);
+      const handled = await handleApiRoute(server, req, res, "/api/users", [route("/api/users")]);
 
       expect(handled).toBe(true);
       expect(res._statusCode).toBe(500);
@@ -761,9 +799,7 @@ describe("handleApiRoute", () => {
       const req = mockReq("GET", "/api/users");
       const res = mockRes();
 
-      const handled = await handleApiRoute(server, req, res, "/api/users", [
-        route("/api/users"),
-      ]);
+      const handled = await handleApiRoute(server, req, res, "/api/users", [route("/api/users")]);
 
       expect(handled).toBe(true);
       expect(res._statusCode).toBe(500);
@@ -779,9 +815,7 @@ describe("handleApiRoute", () => {
       const req = mockReq("GET", "/api/users");
       const res = mockRes();
 
-      await handleApiRoute(server, req, res, "/api/users", [
-        route("/api/users"),
-      ]);
+      await handleApiRoute(server, req, res, "/api/users", [route("/api/users")]);
 
       expect(server.ssrFixStacktrace).toHaveBeenCalledWith(error);
     });

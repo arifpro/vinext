@@ -60,16 +60,16 @@ export interface DeployOptions {
 
 /** Deploy command flag definitions for util.parseArgs. */
 const deployArgOptions = {
-  help:               { type: "boolean", short: "h", default: false },
-  preview:            { type: "boolean", default: false },
-  env:                { type: "string" },
-  name:               { type: "string" },
-  "skip-build":       { type: "boolean", default: false },
-  "dry-run":          { type: "boolean", default: false },
+  help: { type: "boolean", short: "h", default: false },
+  preview: { type: "boolean", default: false },
+  env: { type: "string" },
+  name: { type: "string" },
+  "skip-build": { type: "boolean", default: false },
+  "dry-run": { type: "boolean", default: false },
   "experimental-tpr": { type: "boolean", default: false },
-  "tpr-coverage":     { type: "string" },
-  "tpr-limit":        { type: "string" },
-  "tpr-window":       { type: "string" },
+  "tpr-coverage": { type: "string" },
+  "tpr-limit": { type: "string" },
+  "tpr-window": { type: "string" },
 } as const;
 
 export function parseDeployArgs(args: string[]) {
@@ -117,13 +117,48 @@ interface ProjectInfo {
 
 // ─── Detection ───────────────────────────────────────────────────────────────
 
+/** Check whether a wrangler config file exists in the given directory. */
+export function hasWranglerConfig(root: string): boolean {
+  return (
+    fs.existsSync(path.join(root, "wrangler.jsonc")) ||
+    fs.existsSync(path.join(root, "wrangler.json")) ||
+    fs.existsSync(path.join(root, "wrangler.toml"))
+  );
+}
+
+/**
+ * Build the error message thrown when cloudflare() is missing from the Vite config.
+ * Shared between the build-time guard (index.ts configResolved) and the
+ * deploy-time guard (deploy.ts deploy()).
+ */
+export function formatMissingCloudflarePluginError(options: {
+  isAppRouter: boolean;
+  configFile?: string;
+}): string {
+  const cfArg = options.isAppRouter
+    ? '{\n      viteEnvironment: { name: "rsc", childEnvironments: ["ssr"] },\n    }'
+    : "";
+  const configRef = options.configFile ? options.configFile : "your Vite config";
+  return (
+    `[vinext] Missing @cloudflare/vite-plugin in ${configRef}.\n\n` +
+    `  Cloudflare Workers builds require the cloudflare() plugin.\n` +
+    `  Add it to ${configRef}:\n\n` +
+    `    import { cloudflare } from "@cloudflare/vite-plugin";\n\n` +
+    `    export default defineConfig({\n` +
+    `      plugins: [\n` +
+    `        vinext(),\n` +
+    `        cloudflare(${cfArg}),\n` +
+    `      ],\n` +
+    `    });\n\n` +
+    `  Or delete ${configRef} and re-run \`vinext deploy\` to auto-generate it.`
+  );
+}
+
 export function detectProject(root: string): ProjectInfo {
   const hasApp =
-    fs.existsSync(path.join(root, "app")) ||
-    fs.existsSync(path.join(root, "src", "app"));
+    fs.existsSync(path.join(root, "app")) || fs.existsSync(path.join(root, "src", "app"));
   const hasPages =
-    fs.existsSync(path.join(root, "pages")) ||
-    fs.existsSync(path.join(root, "src", "pages"));
+    fs.existsSync(path.join(root, "pages")) || fs.existsSync(path.join(root, "src", "pages"));
 
   // Prefer App Router if both exist
   const isAppRouter = hasApp;
@@ -134,10 +169,7 @@ export function detectProject(root: string): ProjectInfo {
     fs.existsSync(path.join(root, "vite.config.js")) ||
     fs.existsSync(path.join(root, "vite.config.mjs"));
 
-  const hasWranglerConfig =
-    fs.existsSync(path.join(root, "wrangler.jsonc")) ||
-    fs.existsSync(path.join(root, "wrangler.json")) ||
-    fs.existsSync(path.join(root, "wrangler.toml"));
+  const wranglerConfigExists = hasWranglerConfig(root);
 
   const hasWorkerEntry =
     fs.existsSync(path.join(root, "worker", "index.ts")) ||
@@ -147,8 +179,8 @@ export function detectProject(root: string): ProjectInfo {
   // Walk up ancestor directories so that monorepo-hoisted packages are found
   // even when node_modules lives at the workspace root rather than app root.
   const hasCloudflarePlugin = _findInNodeModules(root, "@cloudflare/vite-plugin") !== null;
-  const hasRscPlugin        = _findInNodeModules(root, "@vitejs/plugin-rsc") !== null;
-  const hasWrangler         = _findInNodeModules(root, ".bin/wrangler") !== null;
+  const hasRscPlugin = _findInNodeModules(root, "@vitejs/plugin-rsc") !== null;
+  const hasWrangler = _findInNodeModules(root, ".bin/wrangler") !== null;
 
   // Derive project name from package.json or directory name
   let projectName = path.basename(root);
@@ -160,7 +192,7 @@ export function detectProject(root: string): ProjectInfo {
         // Sanitize: Workers names must be lowercase alphanumeric + hyphens
         projectName = pkg.name
           .replace(/^@[^/]+\//, "") // strip npm scope
-          .toLowerCase()            // lowercase BEFORE stripping invalid chars
+          .toLowerCase() // lowercase BEFORE stripping invalid chars
           .replace(/[^a-z0-9-]/g, "-")
           .replace(/-+/g, "-")
           .replace(/^-|-$/g, "");
@@ -207,7 +239,7 @@ export function detectProject(root: string): ProjectInfo {
     isAppRouter,
     isPagesRouter,
     hasViteConfig,
-    hasWranglerConfig,
+    hasWranglerConfig: wranglerConfigExists,
     hasWorkerEntry,
     hasCloudflarePlugin,
     hasRscPlugin,
@@ -413,7 +445,23 @@ export function generateWranglerConfig(info: ProjectInfo): string {
 }
 
 /** Generate worker/index.ts for App Router */
-export function generateAppRouterWorkerEntry(): string {
+export function generateAppRouterWorkerEntry(hasISR = false): string {
+  const isrImports = hasISR
+    ? `import { KVCacheHandler } from "vinext/cloudflare";
+import { setCacheHandler } from "vinext/shims/cache";
+`
+    : "";
+
+  const isrEnvField = hasISR ? `\n  VINEXT_CACHE: KVNamespace;` : "";
+
+  const isrSetup = hasISR
+    ? `    // Wire up KV-backed ISR cache. The vinext RSC entry automatically
+    // registers ctx in ALS so background KV puts use waitUntil — without
+    // this every request would return MISS.
+    setCacheHandler(new KVCacheHandler(env.VINEXT_CACHE));
+`
+    : "";
+
   return `/**
  * Cloudflare Worker entry point — auto-generated by vinext deploy.
  * Edit freely or delete to regenerate on next deploy.
@@ -424,9 +472,9 @@ export function generateAppRouterWorkerEntry(): string {
 import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } from "vinext/server/image-optimization";
 import type { ImageConfig } from "vinext/server/image-optimization";
 import handler from "vinext/server/app-router-entry";
-
+${isrImports}
 interface Env {
-  ASSETS: Fetcher;
+  ASSETS: Fetcher;${isrEnvField}
   IMAGES: {
     input(stream: ReadableStream): {
       transform(options: Record<string, unknown>): {
@@ -436,6 +484,11 @@ interface Env {
   };
 }
 
+interface ExecutionContext {
+  waitUntil(promise: Promise<unknown>): void;
+  passThroughOnException(): void;
+}
+
 // Image security config. SVG sources with .svg extension auto-skip the
 // optimization endpoint on the client side (served directly, no proxy).
 // To route SVGs through the optimizer (with security headers), set
@@ -443,8 +496,8 @@ interface Env {
 // const imageConfig: ImageConfig = { dangerouslyAllowSVG: true };
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    const url = new URL(request.url);
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+${isrSetup}    const url = new URL(request.url);
 
     // Image optimization via Cloudflare Images binding.
     // The parseImageParams validation inside handleImageOptimization
@@ -460,8 +513,10 @@ export default {
       }, allowedWidths);
     }
 
-    // Delegate everything else to vinext
-    return handler.fetch(request);
+    // Delegate everything else to vinext, forwarding ctx so that
+    // ctx.waitUntil() is available to background cache writes and
+    // other deferred work via getRequestExecutionContext().
+    return handler.fetch(request, env, ctx);
   },
 };
 `;
@@ -500,6 +555,11 @@ interface Env {
   };
 }
 
+interface ExecutionContext {
+  waitUntil(promise: Promise<unknown>): void;
+  passThroughOnException(): void;
+}
+
 // Extract config values (embedded at build time in the server entry)
 const basePath: string = vinextConfig?.basePath ?? "";
 const trailingSlash: boolean = vinextConfig?.trailingSlash ?? false;
@@ -512,8 +572,18 @@ const imageConfig: ImageConfig | undefined = vinextConfig?.images ? {
   contentSecurityPolicy: vinextConfig.images.contentSecurityPolicy,
 } : undefined;
 
+function hasBasePath(pathname: string, basePath: string): boolean {
+  if (!basePath) return false;
+  return pathname === basePath || pathname.startsWith(basePath + "/");
+}
+
+function stripBasePath(pathname: string, basePath: string): string {
+  if (!hasBasePath(pathname, basePath)) return pathname;
+  return pathname.slice(basePath.length) || "/";
+}
+
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     try {
       const url = new URL(request.url);
       let pathname = url.pathname;
@@ -527,10 +597,12 @@ export default {
       }
 
       // ── 1. Strip basePath ─────────────────────────────────────────
-      if (basePath && pathname.startsWith(basePath)) {
-        const stripped = pathname.slice(basePath.length) || "/";
-        urlWithQuery = stripped + url.search;
-        pathname = stripped;
+      {
+        const stripped = stripBasePath(pathname, basePath);
+        if (stripped !== pathname) {
+          urlWithQuery = stripped + url.search;
+          pathname = stripped;
+        }
       }
 
       // ── Image optimization via Cloudflare Images binding ──────────
@@ -547,7 +619,7 @@ export default {
       }
 
       // ── 2. Trailing slash normalization ────────────────────────────
-      if (pathname !== "/" && !pathname.startsWith("/api")) {
+      if (pathname !== "/" && pathname !== "/api" && !pathname.startsWith("/api/")) {
         const hasTrailing = pathname.endsWith("/");
         if (trailingSlash && !hasTrailing) {
           return new Response(null, {
@@ -572,26 +644,51 @@ export default {
         request = new Request(strippedUrl, request);
       }
 
-      // Build request context for has/missing condition matching.
-      // headers and redirects run before middleware, so they use this
-      // pre-middleware snapshot. beforeFiles, afterFiles, and fallback
-      // rewrites run after middleware (App Router order), so they use
-      // postMwReqCtx created after x-middleware-request-* headers are
-      // unpacked into request.
+      // Build request context for pre-middleware config matching. Redirects
+      // run before middleware in Next.js. Header match conditions also use the
+      // original request snapshot even though header merging happens later so
+      // middleware response headers can still take precedence.
+      // beforeFiles, afterFiles, and fallback rewrites run after middleware
+      // (App Router order), so they use postMwReqCtx created after
+      // x-middleware-request-* headers are unpacked into request.
       const reqCtx = requestContextFromRequest(request);
 
-      // ── 3. Run middleware ──────────────────────────────────────────
+      // ── 3. Apply redirects from next.config.js ────────────────────
+      if (configRedirects.length) {
+        const redirect = matchRedirect(pathname, configRedirects, reqCtx);
+        if (redirect) {
+          const dest = sanitizeDestination(
+            basePath &&
+              !isExternalUrl(redirect.destination) &&
+              !hasBasePath(redirect.destination, basePath)
+              ? basePath + redirect.destination
+              : redirect.destination,
+          );
+          return new Response(null, {
+            status: redirect.permanent ? 308 : 307,
+            headers: { Location: dest },
+          });
+        }
+      }
+
+      // ── 4. Run middleware ──────────────────────────────────────────
       let resolvedUrl = urlWithQuery;
       const middlewareHeaders: Record<string, string | string[]> = {};
       let middlewareRewriteStatus: number | undefined;
       if (typeof runMiddleware === "function") {
-        const result = await runMiddleware(request);
+        const result = await runMiddleware(request, ctx);
 
         if (!result.continue) {
           if (result.redirectUrl) {
+            const redirectHeaders = new Headers({ Location: result.redirectUrl });
+            if (result.responseHeaders) {
+              for (const [key, value] of result.responseHeaders) {
+                redirectHeaders.append(key, value);
+              }
+            }
             return new Response(null, {
               status: result.redirectStatus ?? 307,
-              headers: { Location: result.redirectUrl },
+              headers: redirectHeaders,
             });
           }
           if (result.response) {
@@ -634,9 +731,11 @@ export default {
       const { postMwReqCtx, request: postMwReq } = applyMiddlewareRequestHeaders(middlewareHeaders, request);
       request = postMwReq;
 
+      // Config header matching must keep using the original normalized pathname
+      // even if middleware rewrites the downstream route/render target.
       let resolvedPathname = resolvedUrl.split("?")[0];
 
-      // ── 4. Apply custom headers from next.config.js ───────────────
+      // ── 5. Apply custom headers from next.config.js ───────────────
       // Config headers are additive for multi-value headers (Vary,
       // Set-Cookie) and override for everything else. Vary values are
       // comma-joined per HTTP spec. Set-Cookie values are accumulated
@@ -644,7 +743,7 @@ export default {
       // Middleware headers take precedence: skip config keys already set
       // by middleware so middleware always wins for the same key.
       if (configHeaders.length) {
-        const matched = matchHeaders(resolvedPathname, configHeaders, reqCtx);
+        const matched = matchHeaders(pathname, configHeaders, reqCtx);
         for (const h of matched) {
           const lk = h.key.toLowerCase();
           if (lk === "set-cookie") {
@@ -663,22 +762,6 @@ export default {
             // did not already place this key on the response.
             middlewareHeaders[lk] = h.value;
           }
-        }
-      }
-
-      // ── 5. Apply redirects from next.config.js ────────────────────
-      if (configRedirects.length) {
-        const redirect = matchRedirect(resolvedPathname, configRedirects, reqCtx);
-        if (redirect) {
-          const dest = sanitizeDestination(
-            basePath && !redirect.destination.startsWith(basePath)
-              ? basePath + redirect.destination
-              : redirect.destination,
-          );
-          return new Response(null, {
-            status: redirect.permanent ? 308 : 307,
-            headers: { Location: dest },
-          });
         }
       }
 
@@ -717,7 +800,7 @@ export default {
       // ── 9. Page routes ────────────────────────────────────────────
       let response: Response | undefined;
       if (typeof renderPage === "function") {
-        response = await renderPage(request, resolvedUrl, null);
+        response = await renderPage(request, resolvedUrl, null, ctx);
 
         // ── 10. Fallback rewrites (if SSR returned 404) ─────────────
         if (response && response.status === 404 && configRewrites.fallback?.length) {
@@ -726,7 +809,7 @@ export default {
             if (isExternalUrl(fallbackRewrite)) {
               return proxyExternalRequest(request, fallbackRewrite);
             }
-            response = await renderPage(request, fallbackRewrite, null);
+            response = await renderPage(request, fallbackRewrite, null, ctx);
           }
         }
       }
@@ -993,7 +1076,7 @@ export function getFilesToGenerate(info: ProjectInfo): GeneratedFile[] {
   // Static exports are pure asset deployments — no Worker script needed.
   if (!info.hasWorkerEntry && info.output !== "export") {
     const workerContent = info.isAppRouter
-      ? generateAppRouterWorkerEntry()
+      ? generateAppRouterWorkerEntry(info.hasISR)
       : generatePagesRouterWorkerEntry();
     files.push({
       path: path.join(info.root, "worker", "index.ts"),
@@ -1054,7 +1137,9 @@ export interface WranglerDeployArgs {
   env: string | undefined;
 }
 
-export function buildWranglerDeployArgs(options: Pick<DeployOptions, "preview" | "env">): WranglerDeployArgs {
+export function buildWranglerDeployArgs(
+  options: Pick<DeployOptions, "preview" | "env">,
+): WranglerDeployArgs {
   const args = ["deploy"];
   const env = options.env || (options.preview ? "preview" : undefined);
   if (env) {
@@ -1066,7 +1151,8 @@ export function buildWranglerDeployArgs(options: Pick<DeployOptions, "preview" |
 function runWranglerDeploy(root: string, options: Pick<DeployOptions, "preview" | "env">): string {
   // Walk up ancestor directories so the binary is found even when node_modules
   // is hoisted to the workspace root in a monorepo.
-  const wranglerBin = _findInNodeModules(root, ".bin/wrangler") ??
+  const wranglerBin =
+    _findInNodeModules(root, ".bin/wrangler") ??
     path.join(root, "node_modules", ".bin", "wrangler"); // fallback for error message clarity
 
   const execOpts: ExecSyncOptions = {
@@ -1140,7 +1226,9 @@ export async function deploy(options: DeployOptions): Promise<void> {
     if (reactUpgrade.length > 0) {
       const installCmd = detectPackageManager(root).replace(/ -D$/, "");
       const [pm, ...pmArgs] = installCmd.split(" ");
-      console.log(`  Upgrading ${reactUpgrade.map(d => d.replace(/@latest$/, "")).join(", ")}...`);
+      console.log(
+        `  Upgrading ${reactUpgrade.map((d) => d.replace(/@latest$/, "")).join(", ")}...`,
+      );
       execFileSync(pm, [...pmArgs, ...reactUpgrade], { cwd: root, stdio: "inherit" });
     }
   }
@@ -1173,27 +1261,11 @@ export async function deploy(options: DeployOptions): Promise<void> {
     writeGeneratedFiles(filesToGenerate);
   }
 
-  // Warn if an existing vite.config.ts is missing the Cloudflare plugin.
+  // Fail if an existing Vite config is missing the Cloudflare plugin.
   // This is the most common cause of "could not resolve virtual:vinext-rsc-entry"
   // errors — `vinext init` generates a minimal local-dev config without it.
   if (info.hasViteConfig && !viteConfigHasCloudflarePlugin(root)) {
-    console.warn(`
-  Warning: your vite.config.ts does not appear to import @cloudflare/vite-plugin.
-  Cloudflare Workers deployment requires it. Add the plugin to your config:
-
-    import { cloudflare } from "@cloudflare/vite-plugin";
-
-    export default defineConfig({
-      plugins: [
-        vinext(),
-        cloudflare(${info.isAppRouter ? `{
-          viteEnvironment: { name: "rsc", childEnvironments: ["ssr"] },
-        }` : ""}),
-      ],
-    });
-
-  Or delete vite.config.ts and re-run \`vinext deploy\` to auto-generate it.
-`);
+    throw new Error(formatMissingCloudflarePluginError({ isAppRouter: info.isAppRouter }));
   }
 
   if (options.dryRun) {

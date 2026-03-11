@@ -8,6 +8,14 @@
 import { useState, useEffect, useCallback, useMemo, createElement, type ReactElement } from "react";
 import { RouterContext } from "./internal/router-context.js";
 import { isValidModulePath } from "../client/validate-module-path.js";
+import { toSameOriginPath } from "./url-utils.js";
+import { stripBasePath } from "../utils/base-path.js";
+import {
+  addQueryParam,
+  appendSearchParamsToUrl,
+  type UrlQuery,
+  urlQueryToSearchParams,
+} from "../utils/query.js";
 
 /** basePath from next.config.js, injected by the plugin at build time */
 const __basePath: string = process.env.__NEXT_ROUTER_BASEPATH ?? "";
@@ -18,14 +26,11 @@ function withBasePath(p: string): string {
   return __basePath + p;
 }
 
-/** Strip basePath prefix from a browser pathname */
-function stripBasePath(p: string): string {
-  if (!__basePath) return p;
-  if (p.startsWith(__basePath)) return p.slice(__basePath.length) || "/";
-  return p;
-}
-
-type BeforePopStateCallback = (state: { url: string; as: string; options: { shallow: boolean } }) => boolean;
+type BeforePopStateCallback = (state: {
+  url: string;
+  as: string;
+  options: { shallow: boolean };
+}) => boolean;
 
 interface NextRouter {
   /** Current pathname */
@@ -69,7 +74,7 @@ interface NextRouter {
 
 interface UrlObject {
   pathname?: string;
-  query?: Record<string, string>;
+  query?: UrlQuery;
 }
 
 interface TransitionOptions {
@@ -112,10 +117,25 @@ function resolveUrl(url: string | UrlObject): string {
   if (typeof url === "string") return url;
   let result = url.pathname ?? "/";
   if (url.query) {
-    const params = new URLSearchParams(url.query);
-    result += `?${params.toString()}`;
+    const params = urlQueryToSearchParams(url.query);
+    result = appendSearchParamsToUrl(result, params);
   }
   return result;
+}
+
+/**
+ * When `as` is provided, use it as the navigation target. This is a
+ * simplification: Next.js keeps `url` and `as` as separate values (url for
+ * data fetching, as for the browser URL). We collapse them because vinext's
+ * navigateClient() fetches HTML from the target URL, so `as` must be a
+ * server-resolvable path. Purely decorative `as` values are not supported.
+ */
+function resolveNavigationTarget(
+  url: string | UrlObject,
+  as: string | undefined,
+  locale: string | undefined,
+): string {
+  return applyNavigationLocale(as ?? resolveUrl(url), locale);
 }
 
 /**
@@ -124,6 +144,11 @@ function resolveUrl(url: string | UrlObject): string {
  */
 export function applyNavigationLocale(url: string, locale?: string): string {
   if (!locale || typeof window === "undefined") return url;
+  // Absolute and protocol-relative URLs must not be prefixed — locale
+  // only applies to local paths.
+  if (url.startsWith("http://") || url.startsWith("https://") || url.startsWith("//")) {
+    return url;
+  }
   const defaultLocale = window.__VINEXT_DEFAULT_LOCALE__;
   // Default locale doesn't get a prefix
   if (locale === defaultLocale) return url;
@@ -201,7 +226,9 @@ interface SSRContext {
 let _ssrContext: SSRContext | null = null;
 
 let _getSSRContext = (): SSRContext | null => _ssrContext;
-let _setSSRContextImpl = (ctx: SSRContext | null): void => { _ssrContext = ctx; };
+let _setSSRContextImpl = (ctx: SSRContext | null): void => {
+  _ssrContext = ctx;
+};
 
 /**
  * Register ALS-backed state accessors. Called by router-state.ts on import.
@@ -243,22 +270,26 @@ function extractRouteParamNames(pattern: string): string[] {
 
 function getPathnameAndQuery(): {
   pathname: string;
-  query: Record<string, string>;
+  query: Record<string, string | string[]>;
   asPath: string;
 } {
   if (typeof window === "undefined") {
     const _ssrCtx = _getSSRContext();
     if (_ssrCtx) {
-      const query: Record<string, string> = {};
+      const query: Record<string, string | string[]> = {};
       for (const [key, value] of Object.entries(_ssrCtx.query)) {
-        query[key] = Array.isArray(value) ? value.join(",") : value;
+        query[key] = Array.isArray(value) ? [...value] : value;
       }
       return { pathname: _ssrCtx.pathname, query, asPath: _ssrCtx.asPath };
     }
     return { pathname: "/", query: {}, asPath: "/" };
   }
-  const pathname = stripBasePath(window.location.pathname);
-  const query: Record<string, string> = {};
+  const resolvedPath = stripBasePath(window.location.pathname, __basePath);
+  // In Next.js, router.pathname is the route pattern (e.g., "/posts/[id]"),
+  // not the resolved path ("/posts/42"). __NEXT_DATA__.page holds the route
+  // pattern and is updated by navigateClient() on every client-side navigation.
+  const pathname = window.__NEXT_DATA__?.page ?? resolvedPath;
+  const routeQuery: Record<string, string | string[]> = {};
   // Include dynamic route params from __NEXT_DATA__ (e.g., { id: "42" } from /posts/[id]).
   // Only include keys that are part of the route pattern (not stale query params).
   const nextData = window.__NEXT_DATA__;
@@ -267,18 +298,21 @@ function getPathnameAndQuery(): {
     for (const key of routeParamNames) {
       const value = nextData.query[key];
       if (typeof value === "string") {
-        query[key] = value;
+        routeQuery[key] = value;
       } else if (Array.isArray(value)) {
-        query[key] = value.join(",");
+        routeQuery[key] = [...value];
       }
     }
   }
   // URL search params always reflect the current URL
+  const searchQuery: Record<string, string | string[]> = {};
   const params = new URLSearchParams(window.location.search);
   for (const [key, value] of params) {
-    query[key] = value;
+    addQueryParam(searchQuery, key, value);
   }
-  const asPath = pathname + window.location.search;
+  const query = { ...searchQuery, ...routeQuery };
+  // asPath uses the resolved browser path, not the route pattern
+  const asPath = resolvedPath + window.location.search + window.location.hash;
   return { pathname, query, asPath };
 }
 
@@ -324,8 +358,7 @@ async function navigateClient(url: string): Promise<void> {
 
     // Get the page module URL from __NEXT_DATA__.__vinext (preferred),
     // or fall back to parsing the hydration script
-    let pageModuleUrl: string | undefined =
-      nextData.__vinext?.pageModuleUrl;
+    let pageModuleUrl: string | undefined = nextData.__vinext?.pageModuleUrl;
 
     if (!pageModuleUrl) {
       // Legacy fallback: try to find the module URL in the inline script
@@ -361,8 +394,7 @@ async function navigateClient(url: string): Promise<void> {
 
     // Re-render with the new page, loading _app if needed
     let AppComponent = window.__VINEXT_APP__;
-    const appModuleUrl: string | undefined =
-      nextData.__vinext?.appModuleUrl;
+    const appModuleUrl: string | undefined = nextData.__vinext?.appModuleUrl;
 
     if (!AppComponent && appModuleUrl) {
       if (!isValidModulePath(appModuleUrl)) {
@@ -421,19 +453,12 @@ function buildRouterValue(
   },
 ): NextRouter {
   const _ssrState = _getSSRContext();
-  const locale = typeof window === "undefined"
-    ? _ssrState?.locale
-    : window.__VINEXT_LOCALE__;
-  const locales = typeof window === "undefined"
-    ? _ssrState?.locales
-    : window.__VINEXT_LOCALES__;
-  const defaultLocale = typeof window === "undefined"
-    ? _ssrState?.defaultLocale
-    : window.__VINEXT_DEFAULT_LOCALE__;
+  const locale = typeof window === "undefined" ? _ssrState?.locale : window.__VINEXT_LOCALE__;
+  const locales = typeof window === "undefined" ? _ssrState?.locales : window.__VINEXT_LOCALES__;
+  const defaultLocale =
+    typeof window === "undefined" ? _ssrState?.defaultLocale : window.__VINEXT_DEFAULT_LOCALE__;
 
-  const route = typeof window !== "undefined"
-    ? (window.__NEXT_DATA__?.page ?? pathname)
-    : pathname;
+  const route = typeof window !== "undefined" ? (window.__NEXT_DATA__?.page ?? pathname) : pathname;
 
   return {
     pathname,
@@ -458,19 +483,8 @@ function buildRouterValue(
 export function useRouter(): NextRouter {
   const [{ pathname, query, asPath }, setState] = useState(getPathnameAndQuery);
 
-  useEffect(() => {
-    const onPopState = (e: PopStateEvent) => {
-      setState(getPathnameAndQuery());
-      // Re-render with the new page on back/forward navigation
-      void navigateClient(window.location.pathname + window.location.search).then(() => {
-        restoreScrollPosition(e.state);
-      });
-    };
-    window.addEventListener("popstate", onPopState);
-    return () => window.removeEventListener("popstate", onPopState);
-  }, []);
-
-  // Listen for custom navigation events from Link component
+  // Popstate is handled by the module-level listener below so beforePopState()
+  // is consistently enforced even when multiple components mount useRouter().
   useEffect(() => {
     const onNavigate = ((_e: CustomEvent) => {
       setState(getPathnameAndQuery());
@@ -480,19 +494,27 @@ export function useRouter(): NextRouter {
   }, []);
 
   const push = useCallback(
-    async (url: string | UrlObject, _as?: string, options?: TransitionOptions): Promise<boolean> => {
-      const resolved = applyNavigationLocale(resolveUrl(url), options?.locale);
+    async (url: string | UrlObject, as?: string, options?: TransitionOptions): Promise<boolean> => {
+      let resolved = resolveNavigationTarget(url, as, options?.locale);
 
-      // External URLs — delegate to browser
+      // External URLs — delegate to browser (unless same-origin)
       if (isExternalUrl(resolved)) {
-        window.location.assign(resolved);
-        return true;
+        const localPath = toSameOriginPath(resolved);
+        if (localPath == null) {
+          window.location.assign(resolved);
+          return true;
+        }
+        resolved = localPath;
       }
 
       // Hash-only change — no page fetch needed
       if (isHashOnlyChange(resolved)) {
         const hash = resolved.includes("#") ? resolved.slice(resolved.indexOf("#")) : "";
-        window.history.pushState({}, "", resolved.startsWith("#") ? resolved : withBasePath(resolved));
+        window.history.pushState(
+          {},
+          "",
+          resolved.startsWith("#") ? resolved : withBasePath(resolved),
+        );
         scrollToHash(hash);
         setState(getPathnameAndQuery());
         window.dispatchEvent(new CustomEvent("vinext:navigate"));
@@ -523,19 +545,27 @@ export function useRouter(): NextRouter {
   );
 
   const replace = useCallback(
-    async (url: string | UrlObject, _as?: string, options?: TransitionOptions): Promise<boolean> => {
-      const resolved = applyNavigationLocale(resolveUrl(url), options?.locale);
+    async (url: string | UrlObject, as?: string, options?: TransitionOptions): Promise<boolean> => {
+      let resolved = resolveNavigationTarget(url, as, options?.locale);
 
-      // External URLs — delegate to browser
+      // External URLs — delegate to browser (unless same-origin)
       if (isExternalUrl(resolved)) {
-        window.location.replace(resolved);
-        return true;
+        const localPath = toSameOriginPath(resolved);
+        if (localPath == null) {
+          window.location.replace(resolved);
+          return true;
+        }
+        resolved = localPath;
       }
 
       // Hash-only change — no page fetch needed
       if (isHashOnlyChange(resolved)) {
         const hash = resolved.includes("#") ? resolved.slice(resolved.indexOf("#")) : "";
-        window.history.replaceState({}, "", resolved.startsWith("#") ? resolved : withBasePath(resolved));
+        window.history.replaceState(
+          {},
+          "",
+          resolved.startsWith("#") ? resolved : withBasePath(resolved),
+        );
         scrollToHash(hash);
         setState(getPathnameAndQuery());
         window.dispatchEvent(new CustomEvent("vinext:navigate"));
@@ -584,14 +614,17 @@ export function useRouter(): NextRouter {
   }, []);
 
   const router = useMemo(
-    (): NextRouter => buildRouterValue(pathname, query, asPath, {
-      push,
-      replace,
-      back,
-      reload,
-      prefetch,
-      beforePopState: (cb: BeforePopStateCallback) => { _beforePopStateCb = cb; },
-    }),
+    (): NextRouter =>
+      buildRouterValue(pathname, query, asPath, {
+        push,
+        replace,
+        back,
+        reload,
+        prefetch,
+        beforePopState: (cb: BeforePopStateCallback) => {
+          _beforePopStateCb = cb;
+        },
+      }),
     [pathname, query, asPath, push, replace, back, reload, prefetch],
   );
 
@@ -608,11 +641,15 @@ let _beforePopStateCb: BeforePopStateCallback | undefined;
 if (typeof window !== "undefined") {
   window.addEventListener("popstate", (e: PopStateEvent) => {
     const browserUrl = window.location.pathname + window.location.search;
-    const appUrl = stripBasePath(window.location.pathname) + window.location.search;
+    const appUrl = stripBasePath(window.location.pathname, __basePath) + window.location.search;
 
     // Check beforePopState callback
     if (_beforePopStateCb !== undefined) {
-      const shouldContinue = (_beforePopStateCb as BeforePopStateCallback)({ url: appUrl, as: appUrl, options: { shallow: false } });
+      const shouldContinue = (_beforePopStateCb as BeforePopStateCallback)({
+        url: appUrl,
+        as: appUrl,
+        options: { shallow: false },
+      });
       if (!shouldContinue) return;
     }
 
@@ -651,19 +688,27 @@ export function wrapWithRouterContext(element: ReactElement): ReactElement {
 
 // Also export a default Router singleton for `import Router from 'next/router'`
 const Router = {
-  push: async (url: string | UrlObject, _as?: string, options?: TransitionOptions) => {
-    const resolved = applyNavigationLocale(resolveUrl(url), options?.locale);
+  push: async (url: string | UrlObject, as?: string, options?: TransitionOptions) => {
+    let resolved = resolveNavigationTarget(url, as, options?.locale);
 
-    // External URLs
+    // External URLs (unless same-origin)
     if (isExternalUrl(resolved)) {
-      window.location.assign(resolved);
-      return true;
+      const localPath = toSameOriginPath(resolved);
+      if (localPath == null) {
+        window.location.assign(resolved);
+        return true;
+      }
+      resolved = localPath;
     }
 
     // Hash-only change
     if (isHashOnlyChange(resolved)) {
       const hash = resolved.includes("#") ? resolved.slice(resolved.indexOf("#")) : "";
-      window.history.pushState({}, "", resolved.startsWith("#") ? resolved : withBasePath(resolved));
+      window.history.pushState(
+        {},
+        "",
+        resolved.startsWith("#") ? resolved : withBasePath(resolved),
+      );
       scrollToHash(hash);
       window.dispatchEvent(new CustomEvent("vinext:navigate"));
       return true;
@@ -687,19 +732,27 @@ const Router = {
     window.dispatchEvent(new CustomEvent("vinext:navigate"));
     return true;
   },
-  replace: async (url: string | UrlObject, _as?: string, options?: TransitionOptions) => {
-    const resolved = applyNavigationLocale(resolveUrl(url), options?.locale);
+  replace: async (url: string | UrlObject, as?: string, options?: TransitionOptions) => {
+    let resolved = resolveNavigationTarget(url, as, options?.locale);
 
-    // External URLs
+    // External URLs (unless same-origin)
     if (isExternalUrl(resolved)) {
-      window.location.replace(resolved);
-      return true;
+      const localPath = toSameOriginPath(resolved);
+      if (localPath == null) {
+        window.location.replace(resolved);
+        return true;
+      }
+      resolved = localPath;
     }
 
     // Hash-only change
     if (isHashOnlyChange(resolved)) {
       const hash = resolved.includes("#") ? resolved.slice(resolved.indexOf("#")) : "";
-      window.history.replaceState({}, "", resolved.startsWith("#") ? resolved : withBasePath(resolved));
+      window.history.replaceState(
+        {},
+        "",
+        resolved.startsWith("#") ? resolved : withBasePath(resolved),
+      );
       scrollToHash(hash);
       window.dispatchEvent(new CustomEvent("vinext:navigate"));
       return true;

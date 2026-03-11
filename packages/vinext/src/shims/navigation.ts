@@ -11,15 +11,18 @@
 // would throw at link time for missing bindings. With `import * as React`, the
 // bindings are just `undefined` on the namespace object and we can guard at runtime.
 import * as React from "react";
+import { toSameOriginPath } from "./url-utils.js";
+import { stripBasePath } from "../utils/base-path.js";
+import { ReadonlyURLSearchParams } from "./readonly-url-search-params.js";
 
-// ─── Layout segment depth context ─────────────────────────────────────────────
-// Used by useSelectedLayoutSegments() to know which layout it's inside.
-// The context is created lazily because `React.createContext` is NOT available in
-// the react-server condition of React. In the RSC environment, this remains
-// null and the hooks fall back to returning all segments (depth 0).
-// In SSR and browser environments, the context is created and used normally.
+// ─── Layout segment context ───────────────────────────────────────────────────
+// Stores the child segments below the current layout. Each layout wraps its
+// children with a provider whose value is the remaining route tree segments
+// (including route groups, with dynamic params resolved to actual values).
+// Created lazily because `React.createContext` is NOT available in the
+// react-server condition of React. In the RSC environment, this remains null.
 
-let _LayoutSegmentCtx: React.Context<number> | null = null;
+let _LayoutSegmentCtx: React.Context<string[]> | null = null;
 
 // ─── ServerInsertedHTML context ────────────────────────────────────────────────
 // Used by CSS-in-JS libraries (Apollo Client, styled-components, emotion) to
@@ -46,27 +49,27 @@ export const ServerInsertedHTMLContext: React.Context<
  * Get or create the layout segment context.
  * Returns null in the RSC environment (createContext unavailable).
  */
-export function getLayoutSegmentContext(): React.Context<number> | null {
+export function getLayoutSegmentContext(): React.Context<string[]> | null {
   if (_LayoutSegmentCtx === null && typeof React.createContext === "function") {
-    _LayoutSegmentCtx = React.createContext<number>(0);
+    _LayoutSegmentCtx = React.createContext<string[]>([]);
   }
   return _LayoutSegmentCtx;
 }
 
 /**
- * Read the layout segment depth from context. Returns 0 if no context
- * is available (RSC environment, outside React tree, or root level).
+ * Read the child segments below the current layout from context.
+ * Returns [] if no context is available (RSC environment, outside React tree).
  */
-function useLayoutSegmentDepth(): number {
+function useChildSegments(): string[] {
   const ctx = getLayoutSegmentContext();
-  if (!ctx) return 0;
+  if (!ctx) return [];
   // useContext is safe here because if createContext exists, useContext does too.
   // This branch is only taken in SSR/Browser, never in RSC.
   // Try/catch for unit tests that call this hook outside a React render tree.
   try {
     return React.useContext(ctx);
   } catch {
-    return 0;
+    return [];
   }
 }
 
@@ -79,6 +82,14 @@ export interface NavigationContext {
   searchParams: URLSearchParams;
   params: Record<string, string | string[]>;
 }
+
+const _READONLY_SEARCH_PARAMS = Symbol("vinext.navigation.readonlySearchParams");
+const _READONLY_SEARCH_PARAMS_SOURCE = Symbol("vinext.navigation.readonlySearchParamsSource");
+
+type NavigationContextWithReadonlyCache = NavigationContext & {
+  [_READONLY_SEARCH_PARAMS]?: ReadonlyURLSearchParams;
+  [_READONLY_SEARCH_PARAMS_SOURCE]?: URLSearchParams;
+};
 
 // ---------------------------------------------------------------------------
 // Server-side navigation state lives in a separate server-only module
@@ -94,9 +105,13 @@ let _serverInsertedHTMLCallbacks: Array<() => unknown> = [];
 
 // These are overridden by navigation-state.ts on the server to use ALS.
 let _getServerContext = (): NavigationContext | null => _serverContext;
-let _setServerContext = (ctx: NavigationContext | null): void => { _serverContext = ctx; };
+let _setServerContext = (ctx: NavigationContext | null): void => {
+  _serverContext = ctx;
+};
 let _getInsertedHTMLCallbacks = (): Array<() => unknown> => _serverInsertedHTMLCallbacks;
-let _clearInsertedHTMLCallbacks = (): void => { _serverInsertedHTMLCallbacks = []; };
+let _clearInsertedHTMLCallbacks = (): void => {
+  _serverInsertedHTMLCallbacks = [];
+};
 
 /**
  * Register ALS-backed state accessors. Called by navigation-state.ts on import.
@@ -140,13 +155,6 @@ const isServer = typeof window === "undefined";
 /** basePath from next.config.js, injected by the plugin at build time */
 const __basePath: string = process.env.__NEXT_ROUTER_BASEPATH ?? "";
 
-/** Strip basePath prefix from a browser pathname */
-function stripBasePath(p: string): string {
-  if (!__basePath) return p;
-  if (p.startsWith(__basePath)) return p.slice(__basePath.length) || "/";
-  return p;
-}
-
 /** Prepend basePath to a path for browser URLs / fetches */
 function withBasePath(p: string): string {
   if (!__basePath) return p;
@@ -158,7 +166,7 @@ function withBasePath(p: string): string {
 // ---------------------------------------------------------------------------
 
 /** Maximum number of entries in the RSC prefetch cache. */
-const MAX_PREFETCH_CACHE_SIZE = 50;
+export const MAX_PREFETCH_CACHE_SIZE = 50;
 
 /** TTL for prefetch cache entries in ms (matches Next.js static prefetch TTL). */
 export const PREFETCH_CACHE_TTL = 30_000;
@@ -179,9 +187,8 @@ export function toRscUrl(href: string): string {
   const pathname = qIdx === -1 ? beforeHash : beforeHash.slice(0, qIdx);
   const query = qIdx === -1 ? "" : beforeHash.slice(qIdx);
   // Strip trailing slash (but preserve "/" root) for consistent cache keys
-  const normalizedPath = pathname.length > 1 && pathname.endsWith("/")
-    ? pathname.slice(0, -1)
-    : pathname;
+  const normalizedPath =
+    pathname.length > 1 && pathname.endsWith("/") ? pathname.slice(0, -1) : pathname;
   return normalizedPath + ".rsc" + query;
 }
 
@@ -213,12 +220,29 @@ export function getPrefetchedUrls(): Set<string> {
  */
 export function storePrefetchResponse(rscUrl: string, response: Response): void {
   const cache = getPrefetchCache();
-  // Evict oldest entry if at capacity (Map iterates in insertion order)
+  const now = Date.now();
+
+  // Sweep expired entries before resorting to FIFO eviction
+  if (cache.size >= MAX_PREFETCH_CACHE_SIZE) {
+    const prefetched = getPrefetchedUrls();
+    for (const [key, entry] of cache) {
+      if (now - entry.timestamp >= PREFETCH_CACHE_TTL) {
+        cache.delete(key);
+        prefetched.delete(key);
+      }
+    }
+  }
+
+  // FIFO fallback if still at capacity after sweep
   if (cache.size >= MAX_PREFETCH_CACHE_SIZE) {
     const oldest = cache.keys().next().value;
-    if (oldest !== undefined) cache.delete(oldest);
+    if (oldest !== undefined) {
+      cache.delete(oldest);
+      getPrefetchedUrls().delete(oldest);
+    }
   }
-  cache.set(rscUrl, { response, timestamp: Date.now() });
+
+  cache.set(rscUrl, { response, timestamp: now });
 }
 
 // Client navigation listeners
@@ -233,34 +257,41 @@ function notifyListeners(): void {
 // useSyncExternalStore compares snapshots with Object.is — avoid creating
 // new instances on every render (infinite re-renders).
 let _cachedSearch = !isServer ? window.location.search : "";
-let _cachedSearchParams: URLSearchParams = new URLSearchParams(_cachedSearch);
-let _cachedServerSearchParams: URLSearchParams | null = null;
-let _cachedPathname = !isServer ? stripBasePath(window.location.pathname) : "/";
+let _cachedReadonlySearchParams = new ReadonlyURLSearchParams(_cachedSearch);
+let _cachedEmptyServerSearchParams: ReadonlyURLSearchParams | null = null;
+let _cachedPathname = !isServer ? stripBasePath(window.location.pathname, __basePath) : "/";
 
 function getPathnameSnapshot(): string {
-  const current = stripBasePath(window.location.pathname);
+  const current = stripBasePath(window.location.pathname, __basePath);
   if (current !== _cachedPathname) {
     _cachedPathname = current;
   }
   return _cachedPathname;
 }
 
-function getSearchParamsSnapshot(): URLSearchParams {
+function getSearchParamsSnapshot(): ReadonlyURLSearchParams {
   const current = window.location.search;
   if (current !== _cachedSearch) {
     _cachedSearch = current;
-    _cachedSearchParams = new URLSearchParams(current);
+    _cachedReadonlySearchParams = new ReadonlyURLSearchParams(current);
   }
-  return _cachedSearchParams;
+  return _cachedReadonlySearchParams;
 }
 
-function getServerSearchParamsSnapshot(): URLSearchParams {
-  const ctx = _getServerContext();
-  if (ctx?.searchParams != null) return ctx.searchParams;
-  if (_cachedServerSearchParams === null) {
-    _cachedServerSearchParams = new URLSearchParams();
+function getServerSearchParamsSnapshot(): ReadonlyURLSearchParams {
+  const ctx = _getServerContext() as NavigationContextWithReadonlyCache | null;
+  if (ctx != null) {
+    const searchParams = ctx.searchParams;
+    if (ctx[_READONLY_SEARCH_PARAMS_SOURCE] !== searchParams) {
+      ctx[_READONLY_SEARCH_PARAMS_SOURCE] = searchParams;
+      ctx[_READONLY_SEARCH_PARAMS] = new ReadonlyURLSearchParams(searchParams);
+    }
+    return ctx[_READONLY_SEARCH_PARAMS]!;
   }
-  return _cachedServerSearchParams;
+  if (_cachedEmptyServerSearchParams === null) {
+    _cachedEmptyServerSearchParams = new ReadonlyURLSearchParams();
+  }
+  return _cachedEmptyServerSearchParams;
 }
 
 // Track client-side params (set during RSC hydration/navigation)
@@ -297,8 +328,13 @@ export function usePathname(): string {
     return _getServerContext()?.pathname ?? "/";
   }
   // Client-side: use the hook system for reactivity
-   return React.useSyncExternalStore(
-    (cb: () => void) => { _listeners.add(cb); return () => { _listeners.delete(cb); }; },
+  return React.useSyncExternalStore(
+    (cb: () => void) => {
+      _listeners.add(cb);
+      return () => {
+        _listeners.delete(cb);
+      };
+    },
     getPathnameSnapshot,
     () => _getServerContext()?.pathname ?? "/",
   );
@@ -307,14 +343,19 @@ export function usePathname(): string {
 /**
  * Returns the current search params as a read-only URLSearchParams.
  */
-export function useSearchParams(): URLSearchParams {
+export function useSearchParams(): ReadonlyURLSearchParams {
   if (isServer) {
     // During SSR of "use client" components, the navigation context may not be set.
     // Return a safe fallback — the client will hydrate with the real value.
-    return _getServerContext()?.searchParams ?? new URLSearchParams();
+    return getServerSearchParamsSnapshot();
   }
-   return React.useSyncExternalStore(
-    (cb: () => void) => { _listeners.add(cb); return () => { _listeners.delete(cb); }; },
+  return React.useSyncExternalStore(
+    (cb: () => void) => {
+      _listeners.add(cb);
+      return () => {
+        _listeners.delete(cb);
+      };
+    },
     getSearchParamsSnapshot,
     getServerSearchParamsSnapshot,
   );
@@ -448,17 +489,23 @@ async function navigateImpl(
   mode: "push" | "replace",
   scroll: boolean,
 ): Promise<void> {
-  // External URLs: use full page navigation
+  // Normalize same-origin absolute URLs to local paths for SPA navigation
+  let normalizedHref = href;
   if (isExternalUrl(href)) {
-    if (mode === "replace") {
-      window.location.replace(href);
-    } else {
-      window.location.assign(href);
+    const localPath = toSameOriginPath(href);
+    if (localPath == null) {
+      // Truly external: use full page navigation
+      if (mode === "replace") {
+        window.location.replace(href);
+      } else {
+        window.location.assign(href);
+      }
+      return;
     }
-    return;
+    normalizedHref = localPath;
   }
 
-  const fullHref = withBasePath(href);
+  const fullHref = withBasePath(normalizedHref);
 
   // Save scroll position before navigating (for back/forward restoration)
   if (mode === "push") {
@@ -553,17 +600,19 @@ const _appRouter = {
       headers: { Accept: "text/x-component" },
       credentials: "include",
       priority: "low" as RequestInit["priority"],
-    }).then((response) => {
-      if (response.ok) {
-        storePrefetchResponse(rscUrl, response);
-      } else {
-        // Non-ok response: allow retry on next prefetch() call
+    })
+      .then((response) => {
+        if (response.ok) {
+          storePrefetchResponse(rscUrl, response);
+        } else {
+          // Non-ok response: allow retry on next prefetch() call
+          prefetched.delete(rscUrl);
+        }
+      })
+      .catch(() => {
+        // Network error: allow retry on next prefetch() call
         prefetched.delete(rscUrl);
-      }
-    }).catch(() => {
-      // Network error: allow retry on next prefetch() call
-      prefetched.delete(rscUrl);
-    });
+      });
   },
 };
 
@@ -582,46 +631,41 @@ export function useRouter() {
 /**
  * Returns the active child segment one level below the layout where it's called.
  *
- * In Next.js, this is layout-aware: it returns the segment relative to the
- * nearest parent layout. In our implementation, we approximate by returning
- * the first segment after a specified parallel route key, or the first segment
- * of the pathname. Returns null if at the leaf (no child segments).
+ * Returns the first segment from the route tree below this layout, including
+ * route groups (e.g., "(marketing)") and resolved dynamic params. Returns null
+ * if at the leaf (no child segments).
  *
  * @param parallelRoutesKey - Which parallel route to read (default: "children")
  */
 export function useSelectedLayoutSegment(
-  parallelRoutesKey?: string,
+  // parallelRoutesKey is accepted for API compat but not yet supported —
+  // vinext doesn't implement parallel routes with separate segment tracking.
+  _parallelRoutesKey?: string,
 ): string | null {
-  const segments = useSelectedLayoutSegments(parallelRoutesKey);
+  const segments = useSelectedLayoutSegments(_parallelRoutesKey);
   return segments.length > 0 ? segments[0] : null;
 }
 
 /**
  * Returns all active segments below the layout where it's called.
  *
- * In Next.js, this returns the full array of segments from the current
- * layout down to the leaf page. Each layout in the tree wraps its children
- * with a LayoutSegmentProvider that records the URL segment depth at that
- * level. This hook reads that depth from context and slices the pathname
- * segments accordingly.
+ * Each layout in the App Router tree wraps its children with a
+ * LayoutSegmentProvider whose value is the remaining route tree segments
+ * (including route groups, with dynamic params resolved to actual values
+ * and catch-all segments joined with "/"). This hook reads those segments
+ * directly from context.
  *
  * @param parallelRoutesKey - Which parallel route to read (default: "children")
  */
 export function useSelectedLayoutSegments(
+  // parallelRoutesKey is accepted for API compat but not yet supported —
+  // vinext doesn't implement parallel routes with separate segment tracking.
   _parallelRoutesKey?: string,
 ): string[] {
-  const pathname = usePathname();
-  const depth = useLayoutSegmentDepth();
-  const segments = pathname.split("/").filter(Boolean);
-  return segments.slice(depth);
+  return useChildSegments();
 }
 
-/**
- * ReadonlyURLSearchParams — type alias matching Next.js.
- * In Next.js this prevents mutation, but since URLSearchParams is the underlying
- * type in our implementation, we export it as-is for type compatibility.
- */
-export type ReadonlyURLSearchParams = URLSearchParams;
+export { ReadonlyURLSearchParams };
 
 /**
  * useServerInsertedHTML — inject HTML during SSR from client components.
