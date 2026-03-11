@@ -255,8 +255,13 @@ export function detectProject(root: string): ProjectInfo {
 }
 
 /**
- * Read the `output` field from next.config without resolving async
- * redirects/rewrites/headers (which resolveNextConfig does unnecessarily).
+ * Read the `output` field from next.config.
+ *
+ * Uses `loadNextConfig` (a plain dynamic import of the config file) rather
+ * than `resolveNextConfig` (which also evaluates async `redirects()`,
+ * `rewrites()`, `headers()`, and probes webpack for MDX options). We only
+ * need the single `output` field, so the heavier resolution pass is skipped.
+ * Falls back to `""` on any error so deploy continues normally.
  */
 async function getOutputMode(root: string): Promise<"" | "export" | "standalone"> {
   try {
@@ -383,8 +388,13 @@ function detectNativeModules(root: string): string[] {
 }
 
 /**
- * Directory name for static export output. Used by both `generateWranglerConfig`
- * (assets.directory) and the static export build step so they stay in sync.
+ * Directory name for static export output.
+ * Used by `generateWranglerConfig` (assets.directory) and `runBuild` (static export outDir)
+ * so both always agree on where the static files land.
+ *
+ * NOTE: The static export build (`staticExportPages`/`staticExportApp`) accepts
+ * `outDir` as an external parameter — if you change this value, the call sites
+ * in `runBuild` must also be updated to match.
  */
 const STATIC_EXPORT_DIR = "export";
 
@@ -1112,7 +1122,24 @@ function writeGeneratedFiles(files: GeneratedFile[]): void {
 
 // ─── Build ───────────────────────────────────────────────────────────────────
 
-async function runBuild(info: ProjectInfo): Promise<void> {
+export async function runBuild(info: ProjectInfo): Promise<void> {
+  // Static export (`output: 'export'`) produces a directory of pre-rendered
+  // HTML + static assets — there is no Worker script to build. The static files
+  // must already exist in `STATIC_EXPORT_DIR` (produced by `next build` or
+  // `vinext build`). Wrangler serves them directly from that directory, so we
+  // skip the Workers build entirely here.
+  if (info.output === "export") {
+    const exportDir = path.join(info.root, STATIC_EXPORT_DIR);
+    if (!fs.existsSync(exportDir)) {
+      throw new Error(
+        `Static export directory not found: ${exportDir}\n` +
+          `Run \`next build\` (or \`vinext build\`) first to generate the static files.`,
+      );
+    }
+    console.log(`\n  Static export: using pre-built files in ${STATIC_EXPORT_DIR}/\n`);
+    return;
+  }
+
   console.log("\n  Building for Cloudflare Workers...\n");
 
   // Use Vite's JS API for the build. The user's vite.config.ts (or our

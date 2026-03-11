@@ -19,6 +19,7 @@ import {
   viteConfigHasCloudflarePlugin,
   hasWranglerConfig,
   formatMissingCloudflarePluginError,
+  runBuild,
 } from "../packages/vinext/src/deploy.js";
 import {
   detectPackageManager,
@@ -978,6 +979,28 @@ describe("getFilesToGenerate", () => {
     const viteFile = files.find((f) => f.description === "vite.config.ts");
     expect(viteFile).toBeDefined();
     expect(viteFile!.content).not.toContain("plugin-rsc");
+  });
+});
+
+// ─── runBuild (static export) ─────────────────────────────────────────────────
+
+describe("runBuild (static export)", () => {
+  it("skips Workers build and resolves when export/ directory exists", async () => {
+    mkdir(tmpDir, "app");
+    mkdir(tmpDir, "export"); // simulate pre-built static files
+    const info = detectProject(tmpDir);
+    info.output = "export";
+
+    // Should resolve without calling createBuilder/build — no Vite in test env
+    await expect(runBuild(info)).resolves.toBeUndefined();
+  });
+
+  it("throws when export/ directory is missing for static export", async () => {
+    mkdir(tmpDir, "app");
+    const info = detectProject(tmpDir);
+    info.output = "export";
+
+    await expect(runBuild(info)).rejects.toThrow(/Static export directory not found/);
   });
 });
 
