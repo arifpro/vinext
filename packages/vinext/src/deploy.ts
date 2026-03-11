@@ -394,12 +394,12 @@ function detectNativeModules(root: string): string[] {
 
 /**
  * Directory name for static export output.
- * Used by `generateWranglerConfig` (assets.directory) and `runBuild` (static export outDir)
- * so both always agree on where the static files land.
+ * Used by `generateWranglerConfig` (assets.directory) and `runBuild`
+ * (passed as `outDir` to `staticExportApp`/`staticExportPages`).
  *
- * NOTE: The static export build (`staticExportPages`/`staticExportApp`) accepts
- * `outDir` as an external parameter — if you change this value, the call sites
- * in `runBuild` must also be updated to match.
+ * NOTE: `staticExportApp`/`staticExportPages` accept `outDir` as an external
+ * parameter — there is no compile-time guarantee they use this value. If you
+ * change it here, the call sites in `runBuild` must also be updated to match.
  */
 const STATIC_EXPORT_DIR = "export";
 
@@ -425,13 +425,17 @@ export function generateWranglerConfig(info: ProjectInfo): string {
     $schema: "node_modules/wrangler/config-schema.json",
     name: info.projectName,
     compatibility_date: today,
-    compatibility_flags: ["nodejs_compat"],
+    // Static exports are pure asset deployments — there is no Worker script,
+    // so nodejs_compat is not needed (and would be misleading).
+    ...(!isStaticExport && { compatibility_flags: ["nodejs_compat"] }),
     // Static exports are pure asset deployments — no Worker script needed.
     ...(isStaticExport ? {} : { main: "./worker/index.ts" }),
     assets: {
-      // For static export SPAs, use "404-page" so the CDN serves the custom
-      // 404.html generated at build time rather than a blank 404 response.
-      not_found_handling: isStaticExport ? "404-page" : "none",
+      // For static export SPAs, use "single-page-application" so the CDN
+      // serves index.html for all unmatched paths, allowing client-side
+      // routing to work. Users who want "404-page" for fully pre-rendered
+      // sites can override this in their wrangler.jsonc.
+      not_found_handling: isStaticExport ? "single-page-application" : "none",
       // For static export, wrangler serves files directly from the build output directory.
       ...(isStaticExport && { directory: STATIC_EXPORT_DIR }),
       // Expose static assets to the Worker via env.ASSETS so the image
@@ -1153,6 +1157,9 @@ export async function runBuild(info: ProjectInfo): Promise<void> {
     const server = await createServer({
       root: info.root,
       configFile: false,
+      // `appDir` here is the vinext plugin option for the project root (where
+      // next.config lives), not the `app/` directory. Passing `info.root` so
+      // the plugin resolves config relative to the correct project directory.
       plugins: [vinextPlugin({ appDir: info.root })],
       optimizeDeps: { holdUntilCrawlEnd: true },
       server: { port: 0, cors: false },
@@ -1165,7 +1172,8 @@ export async function runBuild(info: ProjectInfo): Promise<void> {
       const port = typeof addr === "object" && addr ? addr.port : 0;
       const baseUrl = `http://localhost:${port}`;
       const outDir = path.join(info.root, STATIC_EXPORT_DIR);
-      const config = await resolveNextConfig({ output: "export", root: info.root });
+      // resolveNextConfig(config, root) — root is the second positional param
+      const config = await resolveNextConfig({ output: "export" }, info.root);
 
       if (info.isAppRouter) {
         const { appRouter } = await import("./routing/app-router.js");

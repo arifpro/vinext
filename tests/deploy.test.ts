@@ -364,18 +364,19 @@ describe("generateWranglerConfig", () => {
     expect(parsed.images.binding).toBe("IMAGES");
   });
 
-  it("adds directory to assets and omits main/images for static export", () => {
+  it("adds directory to assets and omits main/images/compatibility_flags for static export", () => {
     mkdir(tmpDir, "app");
-    const info = detectProject(tmpDir);
-    info.output = "export";
+    const info = detectProject(tmpDir, "export");
     const config = generateWranglerConfig(info);
     const parsed = JSON.parse(config);
 
     expect(parsed.assets.directory).toBe("export");
     expect(parsed.assets.binding).toBeUndefined();
-    expect(parsed.assets.not_found_handling).toBe("404-page");
+    expect(parsed.assets.not_found_handling).toBe("single-page-application");
     expect(parsed.main).toBeUndefined();
     expect(parsed.images).toBeUndefined();
+    // No Worker script means no nodejs_compat needed
+    expect(parsed.compatibility_flags).toBeUndefined();
   });
 
   it("does not add directory to assets for non-export output", () => {
@@ -389,6 +390,7 @@ describe("generateWranglerConfig", () => {
     expect(parsed.assets.binding).toBe("ASSETS");
     expect(parsed.main).toBe("./worker/index.ts");
     expect(parsed.images).toBeDefined();
+    expect(parsed.compatibility_flags).toContain("nodejs_compat");
   });
 });
 
@@ -1031,16 +1033,20 @@ describe("getFilesToGenerate", () => {
 });
 
 // ─── runBuild (static export) ─────────────────────────────────────────────────
+//
+// Note: `createServer` is imported at the top of deploy.ts and cannot be
+// swapped via vi.doMock here. These tests exercise the static export code path
+// with mocked router/build functions to verify the control flow (correct
+// router branch, no throw). End-to-end correctness is covered by
+// tests/static-export.test.ts.
 
 describe("runBuild (static export)", () => {
-  it("calls staticExportApp for App Router and completes without throwing", async () => {
+  it("takes the App Router branch and completes without throwing", async () => {
     mkdir(tmpDir, "app");
     const info = detectProject(tmpDir, "export");
 
-    // Mock dynamic imports used inside runBuild so the function can complete
-    // without a real Vite project in tmpDir. The top-level `createServer` import
-    // in deploy.ts is already bound, so we can't swap it here — instead we
-    // mock the modules that are `await import()`-ed at runtime.
+    // Mock the dynamic imports inside runBuild. createServer is top-level-bound
+    // and will run for real against the empty tmpDir — Vite tolerates this.
     vi.doMock("../packages/vinext/src/index.js", () => ({ default: vi.fn() }));
     vi.doMock("../packages/vinext/src/config/next-config.js", () => ({
       resolveNextConfig: vi.fn().mockResolvedValue({}),
@@ -1064,7 +1070,7 @@ describe("runBuild (static export)", () => {
     }
   });
 
-  it("calls staticExportPages for Pages Router and completes without throwing", async () => {
+  it("takes the Pages Router branch and completes without throwing", async () => {
     mkdir(tmpDir, "pages");
     const info = detectProject(tmpDir, "export");
 
